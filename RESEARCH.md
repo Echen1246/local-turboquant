@@ -2,6 +2,8 @@
 
 ## Scope
 
+AI-tuned summary of my breakdown at [eddiechen.xyz](https://eddiechen.xyz/writing/turboquant-kv-compression)
+
 This note captures the public-paper understanding we should treat as ground truth before implementing anything for `Qwen/QwQ-32B`.
 
 Date checked: 2026-03-30
