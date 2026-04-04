@@ -1,0 +1,222 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from turboquant.runtime.generation import GenerationOutput, greedy_decode_with_prefill_cache
+from turboquant.telemetry import summarize_generation_metrics
+
+
+@dataclass(frozen=True)
+class TransformersLoadConfig:
+    model_id_or_path: str
+    revision: str | None = None
+    dtype: str | torch.dtype = "auto"
+    device_map: str | dict[str, Any] = "auto"
+    attn_implementation: str = "sdpa"
+    trust_remote_code: bool = False
+    token: str | None = None
+    cache_dir: str | None = None
+
+
+@dataclass(frozen=True)
+class CompatibilityReport:
+    compatible: bool
+    backend: str
+    reasons: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def load_transformers_model(config: TransformersLoadConfig):
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.model_id_or_path,
+        revision=config.revision,
+        token=config.token,
+        cache_dir=config.cache_dir,
+        trust_remote_code=config.trust_remote_code,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_id_or_path,
+        revision=config.revision,
+        token=config.token,
+        cache_dir=config.cache_dir,
+        dtype=config.dtype,
+        device_map=config.device_map,
+        attn_implementation=config.attn_implementation,
+        low_cpu_mem_usage=True,
+        trust_remote_code=config.trust_remote_code,
+    )
+    model.eval()
+    return tokenizer, model
+
+
+def inspect_transformers_model_compatibility(model) -> CompatibilityReport:
+    config = model.config
+    reasons: list[str] = []
+    warnings: list[str] = []
+    details = {
+        "model_type": getattr(config, "model_type", None),
+        "is_encoder_decoder": bool(getattr(config, "is_encoder_decoder", False)),
+        "num_hidden_layers": getattr(config, "num_hidden_layers", None),
+        "num_attention_heads": getattr(config, "num_attention_heads", None),
+        "num_key_value_heads": getattr(config, "num_key_value_heads", None),
+        "sliding_window": getattr(config, "sliding_window", None),
+        "attention_chunk_size": getattr(config, "attention_chunk_size", None),
+        "has_generate": hasattr(model, "generate"),
+        "has_model_layers": bool(hasattr(model, "model") and hasattr(model.model, "layers")),
+        "use_cache": getattr(config, "use_cache", True),
+    }
+
+    if not details["has_generate"]:
+        reasons.append("Model does not expose a generate() method.")
+    if details["is_encoder_decoder"]:
+        reasons.append("Encoder-decoder models are not supported in v1.")
+    if not details["use_cache"]:
+        reasons.append("Model config disables use_cache.")
+    if details["num_hidden_layers"] is None or details["num_attention_heads"] is None:
+        reasons.append("Model is missing standard decoder attention metadata.")
+    if details["sliding_window"] is not None:
+        warnings.append("Sliding-window attention is not explicitly supported in v1.")
+    if details["attention_chunk_size"] is not None:
+        warnings.append("Chunked attention is not explicitly supported in v1.")
+    if getattr(config, "num_kv_shared_layers", None) is not None:
+        warnings.append("Shared-KV-layer models are not explicitly supported in v1.")
+
+    return CompatibilityReport(
+        compatible=not reasons,
+        backend="transformers",
+        reasons=reasons,
+        warnings=warnings,
+        details=details,
+    )
+
+
+def _render_inputs(
+    *,
+    tokenizer,
+    prompt: str | None,
+    messages: list[dict[str, str]] | None,
+    add_generation_prompt: bool,
+):
+    if messages is not None:
+        if not hasattr(tokenizer, "apply_chat_template"):
+            raise ValueError("Tokenizer does not support apply_chat_template, so messages input is unavailable.")
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+        return tokenizer(rendered, return_tensors="pt")
+
+    if prompt is None:
+        raise ValueError("Either prompt or messages must be provided.")
+    return tokenizer(prompt, return_tensors="pt")
+
+
+class TurboQuantSession:
+    def __init__(
+        self,
+        *,
+        model,
+        tokenizer,
+        variant: str = "qmse_packed",
+        bits: int = 3,
+        rotation_seed: int = 0,
+    ) -> None:
+        report = inspect_transformers_model_compatibility(model)
+        if not report.compatible:
+            raise ValueError(f"Incompatible model for TurboQuantSession: {report.reasons}")
+        self.model = model
+        self.tokenizer = tokenizer
+        self.variant = variant
+        self.bits = bits
+        self.rotation_seed = rotation_seed
+        self._last_output: GenerationOutput | None = None
+        self.compatibility = report
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_id_or_path: str,
+        *,
+        revision: str | None = None,
+        dtype: str | torch.dtype = "auto",
+        device_map: str | dict[str, Any] = "auto",
+        attn_implementation: str = "sdpa",
+        trust_remote_code: bool = False,
+        token: str | None = None,
+        cache_dir: str | None = None,
+        variant: str = "qmse_packed",
+        bits: int = 3,
+        rotation_seed: int = 0,
+    ) -> "TurboQuantSession":
+        tokenizer, model = load_transformers_model(
+            TransformersLoadConfig(
+                model_id_or_path=model_id_or_path,
+                revision=revision,
+                dtype=dtype,
+                device_map=device_map,
+                attn_implementation=attn_implementation,
+                trust_remote_code=trust_remote_code,
+                token=token,
+                cache_dir=cache_dir,
+            )
+        )
+        return cls(
+            model=model,
+            tokenizer=tokenizer,
+            variant=variant,
+            bits=bits,
+            rotation_seed=rotation_seed,
+        )
+
+    def generate(
+        self,
+        *,
+        prompt: str | None = None,
+        messages: list[dict[str, str]] | None = None,
+        max_new_tokens: int = 256,
+        add_generation_prompt: bool = True,
+        return_output: bool = False,
+    ) -> str | GenerationOutput:
+        inputs = _render_inputs(
+            tokenizer=self.tokenizer,
+            prompt=prompt,
+            messages=messages,
+            add_generation_prompt=add_generation_prompt,
+        )
+        if torch.cuda.is_available():
+            inputs = {name: tensor.to("cuda") for name, tensor in inputs.items()}
+        output = greedy_decode_with_prefill_cache(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            inputs=inputs,
+            max_new_tokens=max_new_tokens,
+            variant=self.variant,
+            qmse_bits=self.bits,
+            rotation_seed=self.rotation_seed,
+        )
+        self._last_output = output
+        if return_output:
+            return output
+        return output.text
+
+    def last_metrics(self) -> dict[str, Any] | None:
+        if self._last_output is None:
+            return None
+        return self._last_output.metrics.to_dict()
+
+    def last_telemetry(self) -> dict[str, Any] | None:
+        if self._last_output is None:
+            return None
+        return summarize_generation_metrics(self._last_output.metrics).to_dict()
+
+    def compatibility_report(self) -> dict[str, Any]:
+        return self.compatibility.to_dict()

@@ -1,17 +1,15 @@
-"""TurboQuant runtime package."""
+from __future__ import annotations
 
-from turboquant.api import (
+from turboquant.adapters.transformers import (
     CompatibilityReport,
-    TelemetrySummary,
     TransformersLoadConfig,
     TurboQuantSession,
     inspect_transformers_model_compatibility,
     load_transformers_model,
-    summarize_generation_metrics,
 )
+from turboquant.telemetry import TelemetrySummary, summarize_generation_metrics
 
 __all__ = [
-    "__version__",
     "CompatibilityReport",
     "TelemetrySummary",
     "TransformersLoadConfig",
@@ -20,5 +18,3 @@ __all__ = [
     "load_transformers_model",
     "summarize_generation_metrics",
 ]
-
-__version__ = "0.1.0"

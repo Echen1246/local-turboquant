@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "turboquant"
 version = "0.1.0"
-description = "TurboQuant replication project for Qwen/QwQ-32B on Modal"
+description = "TurboQuant-style KV-cache compression runtime for Hugging Face Transformers"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -35,9 +35,6 @@ dev = [
   "pytest>=8.3.5",
   "ruff>=0.11.4",
 ]
-
-[project.scripts]
-turboquant = "turboquant.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

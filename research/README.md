@@ -130,7 +130,7 @@ This is best viewed today as a serious research implementation and packed-cache 
 - [src/turboquant/quantization/turboquant_mse.py](/Users/eddie/Documents/turboquant/src/turboquant/quantization/turboquant_mse.py): reference `Q_mse` math
 - [src/turboquant/runtime/packed_qmse_cache.py](/Users/eddie/Documents/turboquant/src/turboquant/runtime/packed_qmse_cache.py): packed cache format and layer-local dequantization
 - [src/turboquant/runtime/memory_accounting.py](/Users/eddie/Documents/turboquant/src/turboquant/runtime/memory_accounting.py): cache byte accounting and GPU memory sampling
-- [src/turboquant/benchmarks/niah.py](/Users/eddie/Documents/turboquant/src/turboquant/benchmarks/niah.py): local NIAH protocol
+- [research/benchmarks/niah.py](/Users/eddie/Documents/turboquant/research/benchmarks/niah.py): local NIAH protocol
 - [RESEARCH.md](/Users/eddie/Documents/turboquant/RESEARCH.md): longer-form notes and caveats
 
 ## Install
