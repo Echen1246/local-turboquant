@@ -108,6 +108,49 @@ Useful knobs:
 - `--device-map auto`
 - `--dtype auto`
 
+## Small smoke tests
+
+Local machine:
+
+```bash
+PYTHONPATH=src .venv/bin/python examples/local_smoke.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct
+```
+
+Modal GPU:
+
+```bash
+modal run examples/modal_smoke.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --variant qmse_packed \
+  --bits 3
+```
+
+Recommended first models:
+
+- `Qwen/Qwen2.5-0.5B-Instruct` for the lightest first local test
+- `Qwen/Qwen2.5-1.5B-Instruct` if you want a slightly stronger small-model sanity check
+
+## Telemetry
+
+Current telemetry reports:
+
+- dense KV payload bytes
+- packed KV estimate bytes
+- packed KV actual payload bytes
+- CUDA allocated/reserved bytes after cache setup
+- CUDA peak allocated/reserved bytes during decode
+- generation seconds
+- quantization seconds
+
+Current telemetry does **not** report:
+
+- GPU utilization percent
+- system RAM usage
+- a fused-kernel speedup number
+
+So today the most trustworthy savings metric is KV cache payload size, with GPU allocated/reserved memory as supporting runtime telemetry.
+
 ## Current library direction
 
 The library is being shaped for decoder-only Hugging Face `transformers` models with standard KV cache behavior.
