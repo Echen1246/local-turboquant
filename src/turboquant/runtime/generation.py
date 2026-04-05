@@ -128,6 +128,9 @@ def greedy_decode_with_prefill_cache(
             past_key_values = packed_cache
             packed_actual = packed_cache_storage_breakdown(packed_cache)
             quantization_seconds += time.monotonic() - quant_started
+
+            from turboquant.adapters.transformers import enable_turboquant_attention
+            _old_attn_impl = enable_turboquant_attention(model, packed_cache)
         else:
             packed_actual = None
             recon_quality = None
@@ -175,6 +178,10 @@ def greedy_decode_with_prefill_cache(
                 quantization_seconds += time.monotonic() - quant_started
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
             generated_tokens.append(next_token)
+
+    if variant == "qmse_packed":
+        from turboquant.adapters.transformers import disable_turboquant_attention
+        disable_turboquant_attention(model, packed_cache, _old_attn_impl)
 
     completion_tokens = torch.cat(generated_tokens, dim=-1)
     text = tokenizer.decode(completion_tokens[0], skip_special_tokens=True).strip()

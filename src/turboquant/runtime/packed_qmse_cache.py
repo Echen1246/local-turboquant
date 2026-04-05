@@ -212,6 +212,7 @@ class PackedMSELayer(CacheLayerMixin):
         self._keys_outlier_qjl: PackedQJL | None = None
 
         self._force_dense: bool = False
+        self._lazy_update: bool = False
 
         # Dense buffer for generated tokens (when quantize_decode=False)
         self._dense_keys: torch.Tensor | None = None
@@ -532,6 +533,67 @@ class PackedMSELayer(CacheLayerMixin):
             return self._decode_merge(self.values_packed, self._values_outlier)
         return self._decode_group(self.values_packed, self.rotation, self.centers)
 
+    # ------------------------------------------------------------------
+    # Range decoding for chunked attention
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _slice_packed(packed: PackedTensorMSE, start: int, end: int) -> PackedTensorMSE:
+        """Slice a PackedTensorMSE along the sequence dimension."""
+        b, h, s, d = packed.original_shape
+        return PackedTensorMSE(
+            packed_indices=packed.packed_indices[:, :, start:end, :].contiguous(),
+            norms=packed.norms[:, :, start:end].contiguous(),
+            original_shape=(b, h, end - start, d),
+            original_dtype=packed.original_dtype,
+            bits=packed.bits,
+        )
+
+    @staticmethod
+    def _slice_qjl(qjl: PackedQJL, start: int, end: int, batch: int, heads: int) -> PackedQJL:
+        """Slice a PackedQJL along the sequence dimension."""
+        return PackedQJL(
+            packed_signs=qjl.packed_signs[:, :, start:end, :].contiguous(),
+            residual_norms=qjl.residual_norms[:, :, start:end].contiguous(),
+            dimension=qjl.dimension,
+        )
+
+    def _decode_keys_range(self, start: int, end: int) -> torch.Tensor:
+        """Decode keys for positions [start:end] only."""
+        kp_slice = self._slice_packed(self.keys_packed, start, end)
+        if self._outlier_enabled and self.use_qjl_keys:
+            ko_slice = self._slice_packed(self._keys_outlier, start, end)
+            kq_slice = self._slice_qjl(self._keys_qjl, start, end,
+                                        *self.keys_packed.original_shape[:2])
+            koq_slice = self._slice_qjl(self._keys_outlier_qjl, start, end,
+                                         *self._keys_outlier.original_shape[:2])
+            return self._decode_keys_merge_qjl(kp_slice, kq_slice, ko_slice, koq_slice)
+        if self._outlier_enabled:
+            ko_slice = self._slice_packed(self._keys_outlier, start, end)
+            return self._decode_merge(kp_slice, ko_slice)
+        if self.use_qjl_keys:
+            kq_slice = self._slice_qjl(self._keys_qjl, start, end,
+                                        *self.keys_packed.original_shape[:2])
+            return self._decode_keys_qjl_group(
+                kp_slice, kq_slice,
+                self._key_rotation, self._key_centers, self._qjl_matrix,
+            )
+        return self._decode_group(kp_slice, self.rotation, self.centers)
+
+    def _decode_values_range(self, start: int, end: int) -> torch.Tensor:
+        """Decode values for positions [start:end] only."""
+        vp_slice = self._slice_packed(self.values_packed, start, end)
+        if self._outlier_enabled:
+            vo_slice = self._slice_packed(self._values_outlier, start, end)
+            return self._decode_merge(vp_slice, vo_slice)
+        return self._decode_group(vp_slice, self.rotation, self.centers)
+
+    def packed_seq_length(self) -> int:
+        """Number of tokens in packed (compressed) storage."""
+        if self.keys_packed is None:
+            return 0
+        return int(self.keys_packed.original_shape[-2])
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -540,6 +602,9 @@ class PackedMSELayer(CacheLayerMixin):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
+
+        if self._lazy_update and not self._force_dense:
+            return self._update_lazy(key_states, value_states)
 
         if self._force_dense:
             return self._update_dense_decode(key_states, value_states)
@@ -554,6 +619,61 @@ class PackedMSELayer(CacheLayerMixin):
         if self.use_qjl_keys:
             return self._update_flat_qjl(key_states, value_states)
         return self._update_flat(key_states, value_states)
+
+    def _update_lazy(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Store the new token without decompressing history.
+
+        Used when the turboquant attention backend handles compressed KV
+        directly.  Only appends to the dense decode buffer (or encodes
+        into packed storage when ``quantize_decode`` is set); returns
+        just the new token's K/V so the custom attention function can
+        combine them with the compressed history itself.
+        """
+        if self.quantize_decode:
+            if self.use_qjl_keys:
+                new_k_mse, new_k_qjl = self._encode_keys_qjl_group(
+                    key_states,
+                    self._key_rotation, self._key_centers, self._key_boundaries,
+                    self.bits - 1, self._qjl_matrix,
+                )
+                self.keys_packed = (
+                    new_k_mse if self.keys_packed is None
+                    else self.keys_packed.append(new_k_mse)
+                )
+                self._keys_qjl = (
+                    new_k_qjl if self._keys_qjl is None
+                    else self._keys_qjl.append(new_k_qjl)
+                )
+            else:
+                new_kp = self._encode_group(
+                    key_states, self.rotation, self.centers, self.boundaries, self.bits,
+                )
+                self.keys_packed = (
+                    new_kp if self.keys_packed is None
+                    else self.keys_packed.append(new_kp)
+                )
+            new_vp = self._encode_group(
+                value_states, self.rotation, self.centers, self.boundaries, self.bits,
+            )
+            self.values_packed = (
+                new_vp if self.values_packed is None
+                else self.values_packed.append(new_vp)
+            )
+        else:
+            if self._dense_keys is None:
+                self._dense_keys = key_states
+            else:
+                self._dense_keys = torch.cat((self._dense_keys, key_states), dim=-2)
+            if self._dense_values is None:
+                self._dense_values = value_states
+            else:
+                self._dense_values = torch.cat((self._dense_values, value_states), dim=-2)
+
+        return key_states, value_states
 
     def _update_dense_decode(
         self,

@@ -25,6 +25,7 @@ turboquant = "turboquant.cli:main"
 benchmarks = [
   "datasets==4.7.0",
   "jsonlines==4.0.0",
+  "matplotlib>=3.9",
   "pandas==3.0.1",
   "tqdm==4.67.3",
 ]

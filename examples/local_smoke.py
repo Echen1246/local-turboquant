@@ -19,6 +19,9 @@ def _run_variant(
     device_map: str,
     num_outlier_channels: int = 0,
     outlier_extra_bits: int = 1,
+    use_qjl_keys: bool = False,
+    quantize_decode: bool = False,
+    norm_guard: bool = True,
 ) -> dict[str, Any]:
     session = TurboQuantSession.from_pretrained(
         model,
@@ -29,6 +32,9 @@ def _run_variant(
         attn_implementation=attn_implementation,
         num_outlier_channels=num_outlier_channels,
         outlier_extra_bits=outlier_extra_bits,
+        use_qjl_keys=use_qjl_keys,
+        quantize_decode=quantize_decode,
+        norm_guard=norm_guard,
     )
     text = session.generate(
         prompt=prompt,
@@ -53,6 +59,9 @@ def main() -> int:
     parser.add_argument("--bits", type=int, default=3)
     parser.add_argument("--num-outlier-channels", type=int, default=0)
     parser.add_argument("--outlier-extra-bits", type=int, default=1)
+    parser.add_argument("--use-qjl-keys", action="store_true", help="Use Q_prod (QJL) for keys.")
+    parser.add_argument("--quantize-decode", action="store_true", help="Quantize decode-phase tokens.")
+    parser.add_argument("--no-norm-guard", action="store_true", help="Disable norm guard.")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--dtype", default="auto")
@@ -90,6 +99,9 @@ def main() -> int:
             device_map=args.device_map,
             num_outlier_channels=args.num_outlier_channels,
             outlier_extra_bits=args.outlier_extra_bits,
+            use_qjl_keys=args.use_qjl_keys,
+            quantize_decode=args.quantize_decode,
+            norm_guard=not args.no_norm_guard,
         )
     )
     print(json.dumps({"model": args.model, "results": results}, indent=2))

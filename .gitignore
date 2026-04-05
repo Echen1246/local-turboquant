@@ -4,6 +4,9 @@
 .venv/
 *.egg-info/
 __pycache__/
+*.pyc
 upstreams/
 results/
 downloads/
+dist/
+build/

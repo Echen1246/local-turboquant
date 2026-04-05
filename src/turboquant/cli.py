@@ -12,6 +12,27 @@ from turboquant import (
 )
 from turboquant.adapters.transformers import TransformersLoadConfig
 
+_SUPPORTED_BITS = [2, 3, 4]
+
+_VARIANTS = {
+    "qmse_packed": "Packed Q_mse cache (default, recommended)",
+    "qmse": "Dense reconstructed Q_mse cache",
+    "baseline": "No quantization (for comparison)",
+}
+
+_TESTED_MODELS = [
+    {
+        "id": "meta-llama/Llama-3.1-8B-Instruct",
+        "status": "fully working",
+        "notes": "80% savings at 73K ctx, all layers quantize cleanly",
+    },
+    {
+        "id": "Qwen/Qwen2.5-7B-Instruct",
+        "status": "works with norm guard",
+        "notes": "3/28 layers kept dense due to extreme key norms, 71.5% savings",
+    },
+]
+
 
 def _format_bytes(num_bytes: int | None) -> str:
     if num_bytes is None:
@@ -47,6 +68,130 @@ def _common_load_kwargs(args) -> dict[str, Any]:
         "token": args.token,
         "cache_dir": args.cache_dir,
     }
+
+
+def _handle_info(args) -> int:
+    from turboquant import __version__
+
+    if args.json:
+        _print_json({
+            "version": __version__,
+            "variants": _VARIANTS,
+            "supported_bits": _SUPPORTED_BITS,
+            "tested_models": _TESTED_MODELS,
+        })
+        return 0
+
+    print(f"TurboQuant v{__version__}")
+    print()
+    print("Quantization modes:")
+    for name, desc in _VARIANTS.items():
+        print(f"  {name:<14} {desc}")
+    print()
+    print(f"Supported bit widths: {', '.join(str(b) for b in _SUPPORTED_BITS)}")
+    print()
+    print("Bit width guide:")
+    print("  4-bit  near-lossless (cosine sim ~0.995), ~75% KV savings")
+    print("  3-bit  very good (cosine sim ~0.983), ~80% KV savings")
+    print("  2-bit  experimental, visibly lossy")
+    print()
+    print("Tested models:")
+    for m in _TESTED_MODELS:
+        print(f"  {m['id']}")
+        print(f"    status: {m['status']}")
+        print(f"    {m['notes']}")
+    print()
+    print("Key flags:")
+    print("  --use-qjl-keys      Enable Q_prod (QJL sign sketch for keys)")
+    print("  --quantize-decode    Quantize decode-phase tokens too")
+    print("  --no-norm-guard      Disable per-layer norm guard (paper-faithful)")
+    return 0
+
+
+def _handle_telemetry(args) -> int:
+    path = Path(args.file)
+    if not path.exists():
+        print(f"File not found: {path}")
+        return 1
+    data = json.loads(path.read_text())
+
+    telemetry = data.get("telemetry")
+    metrics = data.get("metrics")
+    if telemetry is None and metrics is None:
+        print("No telemetry or metrics found in the JSON file.")
+        print("Run with `turboquant run --json` to produce a file with telemetry.")
+        return 1
+
+    variant = data.get("variant", "unknown")
+    bits = data.get("bits")
+    model = data.get("model", "unknown")
+
+    print(f"Model:   {model}")
+    print(f"Variant: {variant}")
+    if bits is not None:
+        print(f"Bits:    {bits}")
+    print()
+
+    if telemetry is not None:
+        dense = telemetry.get("dense_kv_bytes")
+        packed = telemetry.get("packed_actual_bytes") or telemetry.get("packed_estimate_bytes")
+        savings = telemetry.get("payload_savings_percent")
+
+        print("Cache compression:")
+        print(f"  Dense KV cache:  {_format_bytes(dense)}")
+        print(f"  Packed KV cache: {_format_bytes(packed)}")
+        if savings is not None:
+            print(f"  Savings:         {savings:.1f}%")
+        print()
+
+        post_setup = telemetry.get("post_cache_setup_allocated_bytes")
+        peak = telemetry.get("peak_allocated_bytes")
+        print("GPU memory:")
+        print(f"  After cache setup: {_format_bytes(post_setup)}")
+        print(f"  Peak during gen:   {_format_bytes(peak)}")
+        print()
+
+        gen_s = telemetry.get("generation_seconds")
+        quant_s = telemetry.get("quantization_seconds")
+        prompt_tok = telemetry.get("prompt_tokens")
+        comp_tok = telemetry.get("completion_tokens")
+        print("Timing:")
+        if prompt_tok is not None:
+            print(f"  Prompt tokens:       {prompt_tok}")
+        if comp_tok is not None:
+            print(f"  Completion tokens:   {comp_tok}")
+        if quant_s is not None:
+            print(f"  Quantization time:   {quant_s:.3f}s")
+        if gen_s is not None:
+            print(f"  Generation time:     {gen_s:.3f}s")
+            if comp_tok and gen_s > 0:
+                print(f"  Tokens/sec:          {comp_tok / gen_s:.1f}")
+
+    if metrics is not None:
+        recon = metrics.get("reconstruction_quality")
+        if recon is not None:
+            print()
+            print("Reconstruction quality:")
+            k_cos = recon.get("avg_key_cosine_sim")
+            v_cos = recon.get("avg_val_cosine_sim")
+            k_mse = recon.get("avg_key_mse")
+            v_mse = recon.get("avg_val_mse")
+            dense_layers = recon.get("dense_layer_count")
+            quant_layers = recon.get("quantized_layer_count")
+            if k_cos is not None:
+                print(f"  Key cosine sim:      {k_cos:.6f}")
+            if v_cos is not None:
+                print(f"  Value cosine sim:    {v_cos:.6f}")
+            if k_mse is not None:
+                print(f"  Key MSE:             {k_mse:.6f}")
+            if v_mse is not None:
+                print(f"  Value MSE:           {v_mse:.6f}")
+            if dense_layers is not None:
+                print(f"  Dense layers:        {dense_layers}")
+            if quant_layers is not None:
+                print(f"  Quantized layers:    {quant_layers}")
+
+    return 0
 
 
 def _handle_inspect(args) -> int:
@@ -138,6 +283,18 @@ def build_parser() -> argparse.ArgumentParser:
         description="TurboQuant-style KV-cache compression for Hugging Face Transformers.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    info_parser = subparsers.add_parser(
+        "info", help="Show supported quantization settings, bit widths, and tested models."
+    )
+    info_parser.add_argument("--json", action="store_true", help="Print as JSON.")
+    info_parser.set_defaults(func=_handle_info)
+
+    telemetry_parser = subparsers.add_parser(
+        "telemetry", help="Display formatted telemetry from a saved JSON run output."
+    )
+    telemetry_parser.add_argument("file", help="Path to a JSON file from `turboquant run --json`.")
+    telemetry_parser.set_defaults(func=_handle_telemetry)
 
     def add_load_args(target) -> None:
         target.add_argument("--model", required=True, help="Hugging Face model ID or local model path.")

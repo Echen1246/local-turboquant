@@ -180,6 +180,80 @@ class SmokeRunner:
 
 
     @modal.method()
+    def memory_benchmark(
+        self,
+        model: str = "meta-llama/Llama-3.1-8B-Instruct",
+        bits: int = 3,
+        prompt_tokens: int = 2048,
+        max_new_tokens: int = 16,
+        use_qjl_keys: bool = False,
+        quantize_decode: bool = False,
+    ) -> dict[str, object]:
+        """Run baseline vs TurboQuant and compare peak VRAM.
+
+        Measures incremental memory above model weights (peak_minus_pre)
+        to isolate KV cache + attention overhead from static model size.
+        """
+        import gc
+        import torch
+
+        sentence = "The quick brown fox jumps over the lazy dog. "
+        repeats = max(500, (prompt_tokens * 5) // len(sentence) + 1)
+        filler = sentence * repeats
+        prompt = filler[:prompt_tokens * 5]
+
+        results = {}
+        for label, variant, qjl, qdec in [
+            ("baseline", "baseline", False, False),
+            ("turboquant", "qmse_packed", use_qjl_keys, quantize_decode),
+        ]:
+            self._sessions.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            session = self._session_for(
+                model=model, variant=variant, bits=bits,
+                use_qjl_keys=qjl, quantize_decode=qdec,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+
+            pre_mem = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+            output = session.generate(
+                prompt=prompt, max_new_tokens=max_new_tokens, return_output=True,
+            )
+            post_peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+            telem = session.last_telemetry()
+            results[label] = {
+                "pre_allocated_bytes": pre_mem,
+                "peak_allocated_bytes": post_peak,
+                "peak_minus_pre_bytes": post_peak - pre_mem,
+                "prompt_tokens": output.metrics.prompt_tokens,
+                "completion_tokens": output.metrics.completion_tokens,
+                "generation_seconds": output.metrics.generation_seconds,
+                "packed_actual_bytes": telem.get("packed_actual_bytes") if telem else None,
+                "dense_kv_bytes": telem.get("dense_kv_bytes") if telem else None,
+                "text_preview": output.text[:100],
+            }
+
+        baseline_incr = results["baseline"]["peak_minus_pre_bytes"]
+        tq_incr = results["turboquant"]["peak_minus_pre_bytes"]
+        return {
+            "model": model,
+            "bits": bits,
+            "use_qjl_keys": use_qjl_keys,
+            "quantize_decode": quantize_decode,
+            "baseline": results["baseline"],
+            "turboquant": results["turboquant"],
+            "kv_overhead_savings_bytes": baseline_incr - tq_incr,
+            "kv_overhead_savings_percent": round(
+                (baseline_incr - tq_incr) / baseline_incr * 100, 2
+            ) if baseline_incr > 0 else 0,
+        }
+
+    @modal.method()
     def profile_channels(
         self,
         model: str = "Qwen/Qwen2.5-7B-Instruct",
@@ -252,10 +326,21 @@ def main(
     quantize_decode: bool = False,
     norm_guard: bool = True,
     profile_channels: bool = False,
+    memory_benchmark: bool = False,
+    prompt_tokens: int = 2048,
 ) -> None:
     import json
 
-    if profile_channels:
+    if memory_benchmark:
+        result = SmokeRunner().memory_benchmark.remote(
+            model=model,
+            bits=bits,
+            prompt_tokens=prompt_tokens,
+            max_new_tokens=16,
+            use_qjl_keys=use_qjl_keys,
+            quantize_decode=quantize_decode,
+        )
+    elif profile_channels:
         result = SmokeRunner().profile_channels.remote(model=model, prompt=prompt)
     else:
         result = SmokeRunner().run.remote(

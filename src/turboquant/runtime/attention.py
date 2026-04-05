@@ -1,28 +1,21 @@
-"""Paper-faithful TurboQuant Q_prod attention kernel (PyTorch level).
+"""TurboQuant attention kernels — both standalone and HF-integrated.
 
-Computes scaled dot-product attention directly from the two-part Q_prod
-compressed key representation instead of materializing k_hat_prod vectors.
+Provides two interfaces:
 
-The TurboQuant paper prescribes this for decode-time attention:
+1. ``qprod_attention`` — standalone function that computes attention from
+   the two-part Q_prod compressed key representation.
+
+2. ``turboquant_attention_forward`` — registered as an HF Transformers
+   ``AttentionInterface`` backend so the model's own forward pass uses
+   compressed KV directly, avoiding full decompression in ``cache.update()``.
+
+The TurboQuant paper prescribes decode-time attention as:
 
     logit[q, k] = <q, k_hat_mse> + sqrt(pi/2)/d * ||r|| * <Sq, qjl>
 
-where:
-    k_hat_mse = R^T @ centers[idx] * ||k||    (MSE reconstruction at b-1 bits)
-    r         = k - k_hat_mse                  (residual, only norm stored)
-    S         = random JL matrix               (shared across all keys in a layer)
-    qjl       = sign(S @ r)                    (1-bit per dimension)
-
 The first term is a standard inner product with the MSE-reconstructed key.
 The second term is a scalar QJL correction that makes the combined logit
-an UNBIASED estimate of <q, k>.  This unbiasedness prevents the systematic
-attention drift that causes repetition loops during autoregressive decode.
-
-For HuggingFace Transformers integration, the materialization approach
-(returning k_hat_prod from cache.update()) gives mathematically identical
-logits and works with standard F.scaled_dot_product_attention.  This module
-provides the efficient direct-from-compressed path for custom inference
-pipelines or future Triton/CUDA kernels.
+an UNBIASED estimate of <q, k>.
 """
 
 from __future__ import annotations
@@ -31,6 +24,7 @@ from math import pi, sqrt
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from turboquant.runtime.packed_qmse_cache import PackedMSELayer
@@ -41,6 +35,226 @@ def _repeat_kv(tensor: torch.Tensor, n_rep: int) -> torch.Tensor:
         return tensor
     return tensor.repeat_interleave(n_rep, dim=1)
 
+
+# ---------------------------------------------------------------------------
+# HF Transformers AttentionInterface integration
+# ---------------------------------------------------------------------------
+
+def turboquant_attention_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    is_causal: bool | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    """HF-compatible attention that works directly from compressed KV cache.
+
+    When ``module._tq_cache_layer`` is set (a ``PackedMSELayer``), this
+    computes attention from the compressed representation, avoiding the
+    full decompression that the normal ``cache.update()`` path requires.
+
+    When no compressed cache is attached (e.g. during prefill), falls
+    through to standard ``F.scaled_dot_product_attention``.
+    """
+    cache_layer: PackedMSELayer | None = getattr(module, "_tq_cache_layer", None)
+
+    if cache_layer is None or cache_layer._force_dense:
+        return _sdpa_fallback(module, query, key, value, attention_mask, scaling)
+
+    n_kv_groups = getattr(module, "num_key_value_groups", 1)
+
+    # In lazy mode, update() already stored the new token in the cache
+    # (packed or dense buffer), so we must NOT pass it again as new_key/
+    # new_value — that would double-count it.
+    output = chunked_turboquant_attention(
+        query_states=query,
+        packed_layer=cache_layer,
+        new_key=None,
+        new_value=None,
+        n_kv_groups=n_kv_groups,
+        attention_mask=attention_mask,
+    )
+    # chunked_turboquant_attention returns [B, Q_heads, Sq, D]; HF expects [B, Sq, Q_heads, D]
+    output = output.transpose(1, 2).contiguous()
+    return output, None
+
+
+def _sdpa_fallback(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float | None,
+) -> tuple[torch.Tensor, None]:
+    """Standard SDPA path for prefill or force-dense layers."""
+    n_kv_groups = getattr(module, "num_key_value_groups", 1)
+    if n_kv_groups > 1:
+        key = _repeat_kv(key, n_kv_groups)
+        value = _repeat_kv(value, n_kv_groups)
+
+    causal = attention_mask is None and query.shape[-2] > 1
+    attn_output = F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=causal,
+        scale=scaling,
+    )
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, None
+
+
+def _register_attention_backend() -> None:
+    """Register 'turboquant' with the HF AttentionInterface (idempotent)."""
+    try:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        if "turboquant" not in ALL_ATTENTION_FUNCTIONS:
+            ALL_ATTENTION_FUNCTIONS.register("turboquant", turboquant_attention_forward)
+    except ImportError:
+        return
+
+    try:
+        from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+        if "turboquant" not in ALL_MASK_ATTENTION_FUNCTIONS:
+            sdpa_mask = ALL_MASK_ATTENTION_FUNCTIONS["sdpa"]
+            ALL_MASK_ATTENTION_FUNCTIONS.register("turboquant", sdpa_mask)
+    except (ImportError, KeyError):
+        pass
+
+
+_register_attention_backend()
+
+
+# ---------------------------------------------------------------------------
+# Chunked online-softmax attention (Phase 2 — real peak VRAM savings)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CHUNK_SIZE = 1024
+
+
+def _online_softmax_update(
+    running_max: torch.Tensor,
+    running_sum: torch.Tensor,
+    running_output: torch.Tensor,
+    chunk_logits: torch.Tensor,
+    chunk_values: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One step of online softmax accumulation.
+
+    All tensors are float32. ``chunk_logits`` is [B, Q, Sq, C] and
+    ``chunk_values`` is [B, Q, C, D].
+    """
+    chunk_max = chunk_logits.max(dim=-1, keepdim=True).values  # [B,Q,Sq,1]
+    new_max = torch.maximum(running_max, chunk_max)
+
+    correction = torch.exp(running_max - new_max)
+    running_sum = running_sum * correction
+    running_output = running_output * correction
+
+    exp_logits = torch.exp(chunk_logits - new_max)  # [B,Q,Sq,C]
+    running_sum = running_sum + exp_logits.sum(dim=-1, keepdim=True)
+    running_output = running_output + exp_logits @ chunk_values.float()
+
+    return new_max, running_sum, running_output
+
+
+def chunked_turboquant_attention(
+    query_states: torch.Tensor,
+    packed_layer: "PackedMSELayer",
+    new_key: torch.Tensor | None = None,
+    new_value: torch.Tensor | None = None,
+    n_kv_groups: int = 1,
+    attention_mask: torch.Tensor | None = None,
+    chunk_size: int = _DEFAULT_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Compute attention from compressed cache using chunked online softmax.
+
+    Unlike ``qprod_attention`` which decompresses the entire history at once,
+    this function processes the compressed cache in chunks of ``chunk_size``
+    tokens.  Peak decompressed memory per layer is bounded by
+    ``chunk_size * D * 2`` (keys + values) regardless of total sequence length.
+    """
+    B, Q, Sq, D = query_states.shape
+    head_scale = 1.0 / sqrt(D)
+    q_float = query_states.float()
+
+    NEG_INF = torch.tensor(float("-inf"), device=query_states.device, dtype=torch.float32)
+    running_max = NEG_INF.expand(B, Q, Sq, 1).clone()
+    running_sum = torch.zeros(B, Q, Sq, 1, device=query_states.device, dtype=torch.float32)
+    running_output = torch.zeros(B, Q, Sq, D, device=query_states.device, dtype=torch.float32)
+
+    mask_offset = 0
+
+    # ── Process compressed packed history in chunks ────────────────
+    packed_len = packed_layer.packed_seq_length()
+    if packed_len > 0:
+        for start in range(0, packed_len, chunk_size):
+            end = min(start + chunk_size, packed_len)
+
+            keys_chunk = packed_layer._decode_keys_range(start, end)
+            vals_chunk = packed_layer._decode_values_range(start, end)
+
+            keys_chunk = _repeat_kv(keys_chunk, n_kv_groups)
+            vals_chunk = _repeat_kv(vals_chunk, n_kv_groups)
+
+            logits_chunk = (q_float @ keys_chunk.float().transpose(-2, -1)) * head_scale
+
+            if attention_mask is not None:
+                mask_slice = attention_mask[:, :, :, mask_offset:mask_offset + (end - start)]
+                logits_chunk = logits_chunk + mask_slice.float()
+
+            running_max, running_sum, running_output = _online_softmax_update(
+                running_max, running_sum, running_output, logits_chunk, vals_chunk,
+            )
+            mask_offset += (end - start)
+            del keys_chunk, vals_chunk
+
+    # ── Process dense decode buffer ────────────────────────────────
+    if packed_layer._dense_keys is not None:
+        dk = _repeat_kv(packed_layer._dense_keys, n_kv_groups)
+        dv = _repeat_kv(packed_layer._dense_values, n_kv_groups)
+        logits_dense = (q_float @ dk.float().transpose(-2, -1)) * head_scale
+        dense_len = dk.shape[-2]
+
+        if attention_mask is not None:
+            mask_slice = attention_mask[:, :, :, mask_offset:mask_offset + dense_len]
+            logits_dense = logits_dense + mask_slice.float()
+
+        running_max, running_sum, running_output = _online_softmax_update(
+            running_max, running_sum, running_output, logits_dense, dv,
+        )
+        mask_offset += dense_len
+
+    # ── Process new token (if any) ─────────────────────────────────
+    if new_key is not None:
+        nk = _repeat_kv(new_key, n_kv_groups)
+        nv = _repeat_kv(new_value, n_kv_groups)
+        logits_new = (q_float @ nk.float().transpose(-2, -1)) * head_scale
+        new_len = nk.shape[-2]
+
+        if attention_mask is not None:
+            mask_slice = attention_mask[:, :, :, mask_offset:mask_offset + new_len]
+            logits_new = logits_new + mask_slice.float()
+
+        running_max, running_sum, running_output = _online_softmax_update(
+            running_max, running_sum, running_output, logits_new, nv,
+        )
+
+    # ── Normalize ──────────────────────────────────────────────────
+    output = running_output / running_sum.clamp(min=1e-8)
+    return output.to(dtype=query_states.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Standalone Q_prod attention (original interface, still usable directly)
+# ---------------------------------------------------------------------------
 
 def qprod_attention(
     query_states: torch.Tensor,

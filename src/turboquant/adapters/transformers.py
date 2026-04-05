@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import Cache
 
 from turboquant.runtime.generation import GenerationOutput, greedy_decode_with_prefill_cache
 from turboquant.telemetry import summarize_generation_metrics
@@ -96,6 +97,57 @@ def inspect_transformers_model_compatibility(model) -> CompatibilityReport:
         warnings=warnings,
         details=details,
     )
+
+
+def enable_turboquant_attention(model, packed_cache: Cache) -> str | None:
+    """Wire TurboQuant compressed cache into the model's attention path.
+
+    For each layer, stashes the corresponding ``PackedMSELayer`` on
+    ``self_attn._tq_cache_layer`` and enables lazy updates so that
+    ``cache.update()`` no longer decompresses the full history.
+
+    Returns the previous ``_attn_implementation`` so it can be restored.
+    """
+    import turboquant.runtime.attention  # noqa: F401 — triggers registration
+
+    layers = _get_model_layers(model)
+    if layers is None:
+        raise RuntimeError("Cannot locate model decoder layers for TurboQuant attention wiring.")
+
+    old_impl = getattr(model.config, "_attn_implementation", None)
+    model.config._attn_implementation = "turboquant"
+
+    for idx, decoder_layer in enumerate(layers):
+        attn_module = decoder_layer.self_attn
+        cache_layer = packed_cache.layers[idx]
+        attn_module._tq_cache_layer = cache_layer
+        cache_layer._lazy_update = True
+
+    return old_impl
+
+
+def disable_turboquant_attention(model, packed_cache: Cache, old_impl: str | None = "sdpa") -> None:
+    """Reverse the wiring done by ``enable_turboquant_attention``."""
+    layers = _get_model_layers(model)
+    if layers is None:
+        return
+
+    model.config._attn_implementation = old_impl or "sdpa"
+
+    for idx, decoder_layer in enumerate(layers):
+        attn_module = decoder_layer.self_attn
+        if hasattr(attn_module, "_tq_cache_layer"):
+            del attn_module._tq_cache_layer
+        if idx < len(packed_cache.layers):
+            packed_cache.layers[idx]._lazy_update = False
+
+
+def _get_model_layers(model):
+    """Return the list of decoder layers, handling common model wrappers."""
+    inner = getattr(model, "model", None)
+    if inner is None:
+        return None
+    return getattr(inner, "layers", None)
 
 
 def _render_inputs(
