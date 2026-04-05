@@ -4,7 +4,12 @@ from turboquant.adapters.transformers import (
     CompatibilityReport,
     TransformersLoadConfig,
     TurboQuantSession,
+    activate,
+    deactivate,
     inspect_transformers_model_compatibility,
+    is_active,
+    last_metrics,
+    last_telemetry,
     load_transformers_model,
 )
 from turboquant.telemetry import TelemetrySummary, summarize_generation_metrics
@@ -14,7 +19,12 @@ __all__ = [
     "TelemetrySummary",
     "TransformersLoadConfig",
     "TurboQuantSession",
+    "activate",
+    "deactivate",
     "inspect_transformers_model_compatibility",
+    "is_active",
+    "last_metrics",
+    "last_telemetry",
     "load_transformers_model",
     "summarize_generation_metrics",
 ]

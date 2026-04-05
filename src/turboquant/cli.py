@@ -431,12 +431,89 @@ def _handle_run(args) -> int:
     return 0
 
 
+def _welcome() -> int:
+    from turboquant import __version__
+
+    gpu = _gpu_info()
+
+    CYAN = "\033[36m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+
+    if not sys.stdout.isatty():
+        CYAN = BOLD = DIM = RESET = GREEN = YELLOW = ""
+
+    art = f"""{CYAN}
+  ╔╦╗┬ ┬┬─┐┌┐ ┌─┐╔═╗ ┬ ┬┌─┐┌┐┌┌┬┐
+   ║ │ │├┬┘├┴┐│ │║═╬╗│ │├─┤│││ │
+   ╩ └─┘┴└─└─┘└─┘╚═╝╚└─┘┴ ┴┘└┘ ┴{RESET}
+"""
+    print(art)
+    print(f"  {BOLD}v{__version__}{RESET}  —  KV cache compression for HuggingFace Transformers")
+    print(f"  {DIM}Based on DeepMind's TurboQuant paper (ICLR 2026){RESET}")
+    print(f"  {DIM}github.com/Echen1246/local-turboquant{RESET}")
+    print()
+
+    w = min(shutil.get_terminal_size((80, 24)).columns, 64)
+    bar = "─" * w
+
+    print(f"  {bar}")
+    print()
+    print(f"  {BOLD}Getting started{RESET}")
+    print()
+    print(f"  {GREEN}1.{RESET}  Load any HuggingFace model (local or remote):")
+    print(f"      {DIM}from transformers import AutoModelForCausalLM, AutoTokenizer{RESET}")
+    print(f"      {DIM}model = AutoModelForCausalLM.from_pretrained(\"./my-model\", ...){RESET}")
+    print(f"      {DIM}tokenizer = AutoTokenizer.from_pretrained(\"./my-model\"){RESET}")
+    print()
+    print(f"  {GREEN}2.{RESET}  Activate TurboQuant — one line:")
+    print(f"      {DIM}import turboquant{RESET}")
+    print(f"      {DIM}turboquant.activate(model, tokenizer, bits=4){RESET}")
+    print()
+    print(f"  {GREEN}3.{RESET}  Use model.generate() normally — KV cache is now compressed:")
+    print(f"      {DIM}output = model.generate(input_ids, max_new_tokens=256){RESET}")
+    print()
+    print(f"  {bar}")
+    print()
+    print(f"  {BOLD}Commands{RESET}")
+    print()
+    print(f"  {YELLOW}turboquant setup{RESET}       Detect GPU, system info, model recommendations")
+    print(f"  {YELLOW}turboquant info{RESET}        Supported bit widths, modes, and tested models")
+    print(f"  {YELLOW}turboquant run{RESET}         Run a prompt with TurboQuant compression")
+    print(f"  {YELLOW}turboquant inspect{RESET}     Check if a model is compatible with TurboQuant")
+    print(f"  {YELLOW}turboquant telemetry{RESET}   Display formatted telemetry from a saved run")
+    print()
+    print(f"  {bar}")
+    print()
+    print(f"  {BOLD}System{RESET}")
+
+    if gpu["cuda_available"] and gpu["devices"]:
+        dev = gpu["devices"][0]
+        print(f"  {GREEN}✓{RESET} GPU detected: {dev['name']} ({dev['total_memory_gb']} GB)")
+    elif platform.system() == "Darwin":
+        print(f"  {YELLOW}!{RESET} No CUDA GPU (macOS) — use Modal or a remote GPU for inference")
+    else:
+        print(f"  {YELLOW}!{RESET} No CUDA GPU detected — TurboQuant requires NVIDIA GPU")
+
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if hf_token:
+        print(f"  {GREEN}✓{RESET} HF_TOKEN is set {DIM}(only needed to download gated models){RESET}")
+    else:
+        print(f"  {DIM}i{RESET} HF_TOKEN not set {DIM}(only needed to download gated models like Llama){RESET}")
+
+    print()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="turboquant",
         description="TurboQuant-style KV-cache compression for Hugging Face Transformers.",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=False)
 
     setup_parser = subparsers.add_parser(
         "setup", help="Detect GPU, show system info, and recommend settings."
@@ -539,6 +616,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command is None:
+        return _welcome()
     return int(args.func(args))
 
 

@@ -56,11 +56,11 @@ attention kernel to consume the two-part representation correctly.
 python3 -m venv .venv
 source .venv/bin/activate
 
-pip install git+https://github.com/Echen1246/tq-local.git
+pip install git+https://github.com/Echen1246/local-turboquant.git
 
 # Or for local development
-git clone https://github.com/Echen1246/tq-local.git
-cd tq-local
+git clone https://github.com/Echen1246/local-turboquant.git
+cd local-turboquant
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
@@ -72,7 +72,7 @@ pip install -e ".[dev]"
 python3 -m venv .venv
 source .venv/bin/activate
 
-pip install git+https://github.com/Echen1246/tq-local.git
+pip install git+https://github.com/Echen1246/local-turboquant.git
 ```
 
 > **Note:** macOS does not have CUDA GPUs. TurboQuant will run on CPU for
@@ -86,11 +86,11 @@ pip install git+https://github.com/Echen1246/tq-local.git
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-pip install git+https://github.com/Echen1246/tq-local.git
+pip install git+https://github.com/Echen1246/local-turboquant.git
 
 # Or for local development
-git clone https://github.com/Echen1246/tq-local.git
-cd tq-local
+git clone https://github.com/Echen1246/local-turboquant.git
+cd local-turboquant
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
@@ -101,7 +101,7 @@ pip install -e ".[dev]"
 ```cmd
 python -m venv .venv
 .venv\Scripts\activate.bat
-pip install git+https://github.com/Echen1246/tq-local.git
+pip install git+https://github.com/Echen1246/local-turboquant.git
 ```
 
 ## HuggingFace authentication
@@ -123,42 +123,14 @@ turboquant run --model meta-llama/Llama-3.1-8B-Instruct --token hf_your_token_he
 
 ---
 
-## Quick start: Python API
+## Quick start: activate on any model
+
+The simplest way to use TurboQuant — activate it on your existing model
+and use `model.generate()` normally:
 
 ```python
-from turboquant import TurboQuantSession
-
-# Load model with 4-bit TurboQuant (near-lossless, 75% VRAM savings)
-session = TurboQuantSession.from_pretrained(
-    "meta-llama/Llama-3.1-8B-Instruct",
-    variant="qmse_packed",
-    bits=4,
-    device_map="auto",
-    dtype="auto",
-)
-
-# Generate
-text = session.generate(
-    messages=[{"role": "user", "content": "What is KV cache compression?"}],
-    max_new_tokens=256,
-)
-print(text)
-
-# Inspect telemetry
-telemetry = session.last_telemetry()
-print(f"Dense KV:  {telemetry['dense_kv_bytes'] / 1e9:.2f} GB")
-print(f"Packed KV: {telemetry['packed_actual_bytes'] / 1e9:.2f} GB")
-print(f"Savings:   {telemetry['payload_savings_percent']:.1f}%")
-print(f"Time:      {telemetry['generation_seconds']:.2f}s")
-```
-
-## Quick start: integrating with existing Transformers code
-
-If you already have a HuggingFace Transformers pipeline, TurboQuant wraps it:
-
-```python
+import turboquant
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from turboquant import TurboQuantSession
 
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
 model = AutoModelForCausalLM.from_pretrained(
@@ -167,18 +139,56 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype="auto",
 )
 
-session = TurboQuantSession(
-    model=model,
-    tokenizer=tokenizer,
+# Activate TurboQuant — one line, that's it
+turboquant.activate(model, tokenizer, bits=4)
+#   TurboQuant activated
+#     Model:      llama (32 layers)
+#     Bits:       4-bit Q_mse
+#     Norm guard: on
+
+# Now use model.generate() exactly as before
+inputs = tokenizer("What is KV cache compression?", return_tensors="pt").to("cuda")
+output = model.generate(inputs.input_ids, max_new_tokens=256)
+# [TurboQuant] 4-bit Q_mse active | call #1
+print(tokenizer.decode(output[0], skip_special_tokens=True))
+
+# Check how well it compressed
+telemetry = turboquant.last_telemetry(model)
+print(f"Savings: {telemetry['payload_savings_percent']:.1f}%")
+
+# Deactivate when done (restores original model.generate)
+turboquant.deactivate(model)
+# [TurboQuant] Deactivated after 1 calls.
+```
+
+Every call to `model.generate()` prints a one-line status confirming
+TurboQuant is active. Pass `quiet=True` to suppress it.
+
+## Quick start: session API
+
+For more control (metrics, multiple prompts, compatibility checks):
+
+```python
+from turboquant import TurboQuantSession
+
+session = TurboQuantSession.from_pretrained(
+    "meta-llama/Llama-3.1-8B-Instruct",
     variant="qmse_packed",
     bits=4,
+    device_map="auto",
+    dtype="auto",
 )
 
 text = session.generate(
-    messages=[{"role": "user", "content": "Hello!"}],
-    max_new_tokens=128,
+    messages=[{"role": "user", "content": "What is KV cache compression?"}],
+    max_new_tokens=256,
 )
 print(text)
+
+telemetry = session.last_telemetry()
+print(f"Dense KV:  {telemetry['dense_kv_bytes'] / 1e9:.2f} GB")
+print(f"Packed KV: {telemetry['packed_actual_bytes'] / 1e9:.2f} GB")
+print(f"Savings:   {telemetry['payload_savings_percent']:.1f}%")
 ```
 
 ---

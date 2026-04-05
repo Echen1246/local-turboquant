@@ -297,3 +297,179 @@ class TurboQuantSession:
 
     def compatibility_report(self) -> dict[str, Any]:
         return self.compatibility.to_dict()
+
+
+@dataclass
+class _TurboQuantState:
+    """Internal state stashed on the model when TurboQuant is active."""
+
+    bits: int
+    rotation_seed: int
+    num_outlier_channels: int
+    outlier_extra_bits: int
+    use_qjl_keys: bool
+    quantize_decode: bool
+    norm_guard: bool
+    original_generate: Any = None
+    call_count: int = 0
+
+
+def activate(
+    model,
+    tokenizer=None,
+    *,
+    bits: int = 4,
+    rotation_seed: int = 0,
+    num_outlier_channels: int = 0,
+    outlier_extra_bits: int = 1,
+    use_qjl_keys: bool = False,
+    quantize_decode: bool = False,
+    norm_guard: bool = True,
+    quiet: bool = False,
+) -> None:
+    """Activate TurboQuant on an existing HuggingFace model.
+
+    After calling this, ``model.generate()`` transparently compresses the
+    KV cache. No other code changes are needed.
+
+    Args:
+        model: A HuggingFace ``AutoModelForCausalLM`` instance.
+        tokenizer: Optional tokenizer. If not provided, one will be loaded
+            from the model's ``name_or_path``.
+        bits: Quantization bit width (2, 3, or 4).
+        quiet: If True, suppress the activation banner.
+    """
+    if hasattr(model, "_tq_state"):
+        raise RuntimeError(
+            "TurboQuant is already active on this model. "
+            "Call turboquant.deactivate(model) first."
+        )
+
+    report = inspect_transformers_model_compatibility(model)
+    if not report.compatible:
+        raise ValueError(f"Model is not compatible with TurboQuant: {report.reasons}")
+
+    if tokenizer is None:
+        name_or_path = getattr(model.config, "_name_or_path", None)
+        if name_or_path:
+            tokenizer = AutoTokenizer.from_pretrained(name_or_path)
+        else:
+            raise ValueError(
+                "Cannot auto-detect tokenizer. Pass tokenizer= explicitly."
+            )
+
+    state = _TurboQuantState(
+        bits=bits,
+        rotation_seed=rotation_seed,
+        num_outlier_channels=num_outlier_channels,
+        outlier_extra_bits=outlier_extra_bits,
+        use_qjl_keys=use_qjl_keys,
+        quantize_decode=quantize_decode,
+        norm_guard=norm_guard,
+        original_generate=model.generate,
+    )
+    model._tq_state = state
+    model._tq_tokenizer = tokenizer
+
+    import functools
+
+    @functools.wraps(state.original_generate)
+    def _tq_generate(input_ids=None, **kwargs):
+        tq: _TurboQuantState = model._tq_state
+        tok = model._tq_tokenizer
+
+        max_new_tokens = kwargs.pop("max_new_tokens", 256)
+        attention_mask = kwargs.pop("attention_mask", None)
+
+        if input_ids is None:
+            raise ValueError("input_ids is required for TurboQuant generate().")
+
+        inputs = {"input_ids": input_ids}
+        if attention_mask is not None:
+            inputs["attention_mask"] = attention_mask
+
+        tq.call_count += 1
+        mode = "Q_prod" if tq.use_qjl_keys else "Q_mse"
+        if not quiet:
+            print(f"[TurboQuant] {tq.bits}-bit {mode} active | call #{tq.call_count}")
+
+        output = greedy_decode_with_prefill_cache(
+            model=model,
+            tokenizer=tok,
+            inputs=inputs,
+            max_new_tokens=max_new_tokens,
+            variant="qmse_packed",
+            qmse_bits=tq.bits,
+            rotation_seed=tq.rotation_seed,
+            num_outlier_channels=tq.num_outlier_channels,
+            outlier_extra_bits=tq.outlier_extra_bits,
+            use_qjl_keys=tq.use_qjl_keys,
+            quantize_decode=tq.quantize_decode,
+            norm_guard=tq.norm_guard,
+        )
+
+        model._tq_last_output = output
+        prompt_len = input_ids.shape[-1]
+        completion_ids = tok.encode(output.text, add_special_tokens=False)
+        full_ids = torch.cat([
+            input_ids[0],
+            torch.tensor(completion_ids, device=input_ids.device),
+        ]).unsqueeze(0)
+        return full_ids
+
+    model.generate = _tq_generate
+
+    if not quiet:
+        model_type = getattr(model.config, "model_type", "unknown")
+        num_layers = getattr(model.config, "num_hidden_layers", "?")
+        mode = "Q_prod" if use_qjl_keys else "Q_mse"
+        guard_status = "on" if norm_guard else "off"
+        print()
+        print(f"  TurboQuant activated")
+        print(f"    Model:      {model_type} ({num_layers} layers)")
+        print(f"    Bits:       {bits}-bit {mode}")
+        print(f"    Norm guard: {guard_status}")
+        print(f"    Decode:     {'quantized' if quantize_decode else 'dense'}")
+        print()
+        print(f"  model.generate() now uses TurboQuant compression.")
+        print(f"  Call turboquant.deactivate(model) to restore original behavior.")
+        print()
+
+
+def deactivate(model, quiet: bool = False) -> None:
+    """Deactivate TurboQuant and restore the original ``model.generate()``."""
+    state: _TurboQuantState | None = getattr(model, "_tq_state", None)
+    if state is None:
+        if not quiet:
+            print("[TurboQuant] Not active on this model, nothing to deactivate.")
+        return
+
+    model.generate = state.original_generate
+
+    for attr in ("_tq_state", "_tq_tokenizer", "_tq_last_output"):
+        if hasattr(model, attr):
+            delattr(model, attr)
+
+    if not quiet:
+        print(f"[TurboQuant] Deactivated after {state.call_count} calls.")
+
+
+def is_active(model) -> bool:
+    """Check whether TurboQuant is currently active on a model."""
+    return hasattr(model, "_tq_state")
+
+
+def last_metrics(model) -> dict[str, Any] | None:
+    """Get metrics from the last TurboQuant generate() call."""
+    output = getattr(model, "_tq_last_output", None)
+    if output is None:
+        return None
+    return output.metrics.to_dict()
+
+
+def last_telemetry(model) -> dict[str, Any] | None:
+    """Get telemetry summary from the last TurboQuant generate() call."""
+    output = getattr(model, "_tq_last_output", None)
+    if output is None:
+        return None
+    return summarize_generation_metrics(output.metrics).to_dict()

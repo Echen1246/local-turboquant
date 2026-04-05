@@ -312,6 +312,182 @@ class SmokeRunner:
             "normal_layer_example": layer_profiles[10] if len(layer_profiles) > 10 else layer_profiles[-1],
         }
 
+    @modal.method()
+    def output_test(
+        self,
+        model: str = "meta-llama/Llama-3.1-8B-Instruct",
+        bits: int = 4,
+        max_new_tokens: int = 64,
+        use_qjl_keys: bool = False,
+        quantize_decode: bool = False,
+    ) -> dict[str, object]:
+        """Compare baseline vs TurboQuant outputs on fixed prompts.
+
+        Tests:
+        1. Quality gates: cosine sim, MSE within expected bounds
+        2. Prefix overlap: how many leading tokens match before divergence
+        3. Reproducibility: two TurboQuant runs produce identical output
+        """
+        import gc
+
+        import torch
+
+        test_prompts = [
+            "What is 2 + 2? Answer with just the number.",
+            "List the first 5 prime numbers separated by commas.",
+            "Translate 'hello world' to French in one phrase.",
+        ]
+
+        quality_thresholds = {
+            4: {"min_cosine": 0.990, "max_key_mse": 0.10},
+            3: {"min_cosine": 0.970, "max_key_mse": 0.50},
+            2: {"min_cosine": 0.900, "max_key_mse": 2.00},
+        }
+        thresholds = quality_thresholds.get(bits, quality_thresholds[3])
+
+        results = []
+        all_passed = True
+
+        for prompt in test_prompts:
+            self._sessions.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            baseline_session = self._session_for(
+                model=model, variant="baseline", bits=bits,
+            )
+            baseline_out = baseline_session.generate(
+                prompt=prompt, max_new_tokens=max_new_tokens, return_output=True,
+            )
+            baseline_text = baseline_out.text
+            baseline_tokens = baseline_out.metrics.completion_tokens
+
+            self._sessions.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            tq_session = self._session_for(
+                model=model, variant="qmse_packed", bits=bits,
+                use_qjl_keys=use_qjl_keys, quantize_decode=quantize_decode,
+            )
+            tq_out = tq_session.generate(
+                prompt=prompt, max_new_tokens=max_new_tokens, return_output=True,
+            )
+            tq_text = tq_out.text
+            tq_tokens = tq_out.metrics.completion_tokens
+
+            tq_out_2 = tq_session.generate(
+                prompt=prompt, max_new_tokens=max_new_tokens, return_output=True,
+            )
+            tq_text_2 = tq_out_2.text
+            reproducible = tq_text == tq_text_2
+
+            recon = tq_out.metrics.reconstruction_quality
+            avg_key_cos = None
+            avg_val_cos = None
+            avg_key_mse = None
+            if recon:
+                quantized = [r for r in recon if not r.get("dense", False)]
+                src = quantized if quantized else recon
+                avg_key_cos = sum(r["key_cosine_sim"] for r in src) / len(src)
+                avg_val_cos = sum(r["val_cosine_sim"] for r in src) / len(src)
+                avg_key_mse = sum(r["key_mse"] for r in src) / len(src)
+
+            cosine_pass = avg_key_cos is not None and avg_key_cos >= thresholds["min_cosine"]
+            mse_pass = avg_key_mse is not None and avg_key_mse <= thresholds["max_key_mse"]
+
+            baseline_words = baseline_text.split()
+            tq_words = tq_text.split()
+            prefix_match = 0
+            for bw, tw in zip(baseline_words, tq_words):
+                if bw == tw:
+                    prefix_match += 1
+                else:
+                    break
+
+            test_passed = cosine_pass and mse_pass and reproducible
+            if not test_passed:
+                all_passed = False
+
+            results.append({
+                "prompt": prompt,
+                "passed": test_passed,
+                "baseline_text": baseline_text,
+                "turboquant_text": tq_text,
+                "baseline_tokens": baseline_tokens,
+                "turboquant_tokens": tq_tokens,
+                "prefix_words_match": prefix_match,
+                "total_baseline_words": len(baseline_words),
+                "reproducible": reproducible,
+                "avg_key_cosine_sim": round(avg_key_cos, 6) if avg_key_cos else None,
+                "avg_val_cosine_sim": round(avg_val_cos, 6) if avg_val_cos else None,
+                "avg_key_mse": round(avg_key_mse, 6) if avg_key_mse else None,
+                "cosine_threshold": thresholds["min_cosine"],
+                "cosine_pass": cosine_pass,
+                "mse_threshold": thresholds["max_key_mse"],
+                "mse_pass": mse_pass,
+            })
+
+        return {
+            "model": model,
+            "bits": bits,
+            "use_qjl_keys": use_qjl_keys,
+            "quantize_decode": quantize_decode,
+            "all_passed": all_passed,
+            "tests_run": len(results),
+            "tests_passed": sum(1 for r in results if r["passed"]),
+            "results": results,
+        }
+
+
+    @modal.method()
+    def activate_test(
+        self,
+        model_id: str = "meta-llama/Llama-3.1-8B-Instruct",
+        bits: int = 4,
+    ) -> dict[str, object]:
+        """Test the turboquant.activate() / deactivate() API."""
+        import turboquant
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id, token=token, cache_dir=HF_CACHE_DIR,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, token=token, cache_dir=HF_CACHE_DIR,
+            device_map="auto", torch_dtype="auto",
+        )
+        model.eval()
+
+        turboquant.activate(model, tokenizer, bits=bits)
+        assert turboquant.is_active(model), "Expected TurboQuant to be active"
+
+        import torch
+        inputs = tokenizer("What is 2 + 2? Answer with just the number.", return_tensors="pt")
+        if torch.cuda.is_available():
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+        output_ids = model.generate(inputs["input_ids"], max_new_tokens=32)
+        text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+        telemetry = turboquant.last_telemetry(model)
+        metrics = turboquant.last_metrics(model)
+
+        turboquant.deactivate(model)
+        assert not turboquant.is_active(model), "Expected TurboQuant to be deactivated"
+
+        return {
+            "model": model_id,
+            "bits": bits,
+            "text": text,
+            "telemetry": telemetry,
+            "has_metrics": metrics is not None,
+            "activate_deactivate_ok": True,
+        }
+
 
 @app.local_entrypoint()
 def main(
@@ -327,11 +503,23 @@ def main(
     norm_guard: bool = True,
     profile_channels: bool = False,
     memory_benchmark: bool = False,
+    output_test: bool = False,
+    activate_test: bool = False,
     prompt_tokens: int = 2048,
 ) -> None:
     import json
 
-    if memory_benchmark:
+    if activate_test:
+        result = SmokeRunner().activate_test.remote(model_id=model, bits=bits)
+    elif output_test:
+        result = SmokeRunner().output_test.remote(
+            model=model,
+            bits=bits,
+            max_new_tokens=64,
+            use_qjl_keys=use_qjl_keys,
+            quantize_decode=quantize_decode,
+        )
+    elif memory_benchmark:
         result = SmokeRunner().memory_benchmark.remote(
             model=model,
             bits=bits,
