@@ -129,6 +129,11 @@ class TurboQuantSession:
         variant: str = "qmse_packed",
         bits: int = 3,
         rotation_seed: int = 0,
+        num_outlier_channels: int = 0,
+        outlier_extra_bits: int = 1,
+        use_qjl_keys: bool = False,
+        quantize_decode: bool = False,
+        norm_guard: bool = True,
     ) -> None:
         report = inspect_transformers_model_compatibility(model)
         if not report.compatible:
@@ -138,6 +143,11 @@ class TurboQuantSession:
         self.variant = variant
         self.bits = bits
         self.rotation_seed = rotation_seed
+        self.num_outlier_channels = num_outlier_channels
+        self.outlier_extra_bits = outlier_extra_bits
+        self.use_qjl_keys = use_qjl_keys
+        self.quantize_decode = quantize_decode
+        self.norm_guard = norm_guard
         self._last_output: GenerationOutput | None = None
         self.compatibility = report
 
@@ -156,6 +166,11 @@ class TurboQuantSession:
         variant: str = "qmse_packed",
         bits: int = 3,
         rotation_seed: int = 0,
+        num_outlier_channels: int = 0,
+        outlier_extra_bits: int = 1,
+        use_qjl_keys: bool = False,
+        quantize_decode: bool = False,
+        norm_guard: bool = True,
     ) -> "TurboQuantSession":
         tokenizer, model = load_transformers_model(
             TransformersLoadConfig(
@@ -175,6 +190,11 @@ class TurboQuantSession:
             variant=variant,
             bits=bits,
             rotation_seed=rotation_seed,
+            num_outlier_channels=num_outlier_channels,
+            outlier_extra_bits=outlier_extra_bits,
+            use_qjl_keys=use_qjl_keys,
+            quantize_decode=quantize_decode,
+            norm_guard=norm_guard,
         )
 
     def generate(
@@ -202,6 +222,11 @@ class TurboQuantSession:
             variant=self.variant,
             qmse_bits=self.bits,
             rotation_seed=self.rotation_seed,
+            num_outlier_channels=self.num_outlier_channels,
+            outlier_extra_bits=self.outlier_extra_bits,
+            use_qjl_keys=self.use_qjl_keys,
+            quantize_decode=self.quantize_decode,
+            norm_guard=self.norm_guard,
         )
         self._last_output = output
         if return_output:

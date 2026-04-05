@@ -11,7 +11,11 @@ from turboquant.runtime.memory_accounting import (
     past_key_values_memory_breakdown,
     turboquant_mse_packed_bytes,
 )
-from turboquant.runtime.packed_qmse_cache import build_packed_mse_cache, packed_cache_storage_breakdown
+from turboquant.runtime.packed_qmse_cache import (
+    build_packed_mse_cache,
+    packed_cache_storage_breakdown,
+    verify_packed_reconstruction,
+)
 
 
 @dataclass(frozen=True)
@@ -27,6 +31,7 @@ class GenerationMetrics:
     turboquant_mse_packed_actual: dict[str, Any] | None
     post_cache_setup_gpu_memory: dict[str, Any] | None
     gpu_peak_memory: dict[str, Any] | None
+    reconstruction_quality: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -66,6 +71,11 @@ def greedy_decode_with_prefill_cache(
     variant: str,
     qmse_bits: int,
     rotation_seed: int = 0,
+    num_outlier_channels: int = 0,
+    outlier_extra_bits: int = 1,
+    use_qjl_keys: bool = False,
+    quantize_decode: bool = False,
+    norm_guard: bool = True,
 ) -> GenerationOutput:
     import torch
 
@@ -100,19 +110,27 @@ def greedy_decode_with_prefill_cache(
             )
             quantization_seconds += time.monotonic() - quant_started
             packed_actual = None
+            recon_quality = None
         elif variant == "qmse_packed":
             quant_started = time.monotonic()
             packed_cache = build_packed_mse_cache(
                 past_key_values,
                 bits=qmse_bits,
                 seed=rotation_seed,
+                num_outlier_channels=num_outlier_channels,
+                outlier_extra_bits=outlier_extra_bits,
+                use_qjl_keys=use_qjl_keys,
+                quantize_decode=quantize_decode,
+                norm_guard=norm_guard,
             )
+            recon_quality = verify_packed_reconstruction(past_key_values, packed_cache)
             del past_key_values
             past_key_values = packed_cache
             packed_actual = packed_cache_storage_breakdown(packed_cache)
             quantization_seconds += time.monotonic() - quant_started
         else:
             packed_actual = None
+            recon_quality = None
 
         del outputs
         if torch.cuda.is_available():
@@ -173,5 +191,6 @@ def greedy_decode_with_prefill_cache(
         turboquant_mse_packed_actual=packed_actual,
         post_cache_setup_gpu_memory=post_cache_setup,
         gpu_peak_memory=gpu_peak_memory_bytes(),
+        reconstruction_quality=recon_quality,
     )
     return GenerationOutput(text=text, metrics=metrics)

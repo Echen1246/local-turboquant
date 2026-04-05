@@ -87,6 +87,11 @@ def _handle_run(args) -> int:
         variant=args.variant,
         bits=args.bits,
         rotation_seed=args.rotation_seed,
+        num_outlier_channels=args.num_outlier_channels,
+        outlier_extra_bits=args.outlier_extra_bits,
+        use_qjl_keys=args.use_qjl_keys,
+        quantize_decode=args.quantize_decode,
+        norm_guard=not args.no_norm_guard,
         **_common_load_kwargs(args),
     )
     text = session.generate(
@@ -170,6 +175,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--bits", type=int, default=3, help="Quantization bits for qmse variants.")
     run_parser.add_argument("--rotation-seed", type=int, default=0, help="Rotation seed. Default: 0.")
+    run_parser.add_argument(
+        "--num-outlier-channels",
+        type=int,
+        default=0,
+        help="Number of head_dim channels to treat as outliers and quantize at higher precision.",
+    )
+    run_parser.add_argument(
+        "--outlier-extra-bits",
+        type=int,
+        default=1,
+        help="Additional bits to allocate to outlier channels beyond the base bit width.",
+    )
+    run_parser.add_argument(
+        "--use-qjl-keys",
+        action="store_true",
+        help="Enable QJL residual correction for keys (TurboQuant_prod). Gives unbiased attention logits.",
+    )
+    run_parser.add_argument(
+        "--quantize-decode",
+        action="store_true",
+        help="Also quantize tokens generated during decode (increases compression, may reduce quality).",
+    )
+    run_parser.add_argument(
+        "--no-norm-guard",
+        action="store_true",
+        help="Disable per-layer norm guard (all layers get quantized, paper-faithful).",
+    )
     run_parser.add_argument("--max-new-tokens", type=int, default=256, help="Max generated tokens.")
     run_parser.add_argument("--json", action="store_true", help="Print full output as JSON.")
     run_parser.add_argument(

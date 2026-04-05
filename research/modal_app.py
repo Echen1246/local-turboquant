@@ -150,6 +150,8 @@ def _run_niah_case_impl(
     variant: str,
     qmse_bits: int,
     rotation_seed: int,
+    num_outlier_channels: int = 0,
+    outlier_extra_bits: int = 1,
 ) -> dict[str, object]:
     import torch
 
@@ -202,6 +204,8 @@ def _run_niah_case_impl(
         variant=variant,
         qmse_bits=qmse_bits,
         rotation_seed=rotation_seed,
+        num_outlier_channels=num_outlier_channels,
+        outlier_extra_bits=outlier_extra_bits,
     )
     response_text = generation.text
     generation_seconds = generation.metrics.generation_seconds
@@ -230,6 +234,8 @@ def _run_niah_case_impl(
         "quantization_seconds": round(quantization_seconds, 4),
         "qmse_bits": qmse_bits if variant in {"qmse", "qmse_packed"} else None,
         "rotation_seed": rotation_seed if variant in {"qmse", "qmse_packed"} else None,
+        "num_outlier_channels": num_outlier_channels if variant in {"qmse", "qmse_packed"} else None,
+        "outlier_extra_bits": outlier_extra_bits if variant in {"qmse", "qmse_packed"} else None,
         "decoder_mode": "manual_greedy_prefill_cache",
         "cache_quantization_scope": (
             "prefill_full_cache_and_incremental_generated_tail"
@@ -783,6 +789,8 @@ def run_niah_case(
     variant: str = "baseline",
     qmse_bits: int = 3,
     rotation_seed: int = 0,
+    num_outlier_channels: int = 0,
+    outlier_extra_bits: int = 1,
 ) -> dict[str, object]:
     return _run_niah_case_impl(
         context_length=context_length,
@@ -794,6 +802,8 @@ def run_niah_case(
         variant=variant,
         qmse_bits=qmse_bits,
         rotation_seed=rotation_seed,
+        num_outlier_channels=num_outlier_channels,
+        outlier_extra_bits=outlier_extra_bits,
     )
 
 
@@ -816,6 +826,8 @@ def run_niah_grid(
     variant: str = "baseline",
     qmse_bits: int = 3,
     rotation_seed: int = 0,
+    num_outlier_channels: int = 0,
+    outlier_extra_bits: int = 1,
 ) -> dict[str, object]:
     lengths = _parse_int_list(context_lengths)
     depths = _parse_float_list(depth_percents)
@@ -834,6 +846,8 @@ def run_niah_grid(
                 variant=variant,
                 qmse_bits=qmse_bits,
                 rotation_seed=rotation_seed,
+                num_outlier_channels=num_outlier_channels,
+                outlier_extra_bits=outlier_extra_bits,
             )
             results.append(case_result)
 
@@ -985,6 +999,8 @@ def main(
     variant: str = "baseline",
     qmse_bits: int = 3,
     rotation_seed: int = 0,
+    num_outlier_channels: int = 0,
+    outlier_extra_bits: int = 1,
     run_name: str | None = None,
 ) -> None:
     if prefetch_only:
@@ -1025,6 +1041,8 @@ def main(
             variant=variant,
             qmse_bits=qmse_bits,
             rotation_seed=rotation_seed,
+            num_outlier_channels=num_outlier_channels,
+            outlier_extra_bits=outlier_extra_bits,
             run_name=run_name,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -1040,6 +1058,8 @@ def main(
             variant=variant,
             qmse_bits=qmse_bits,
             rotation_seed=rotation_seed,
+            num_outlier_channels=num_outlier_channels,
+            outlier_extra_bits=outlier_extra_bits,
             run_name=run_name,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
