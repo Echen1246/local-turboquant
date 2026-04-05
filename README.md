@@ -185,6 +185,15 @@ print(text)
 
 ## CLI commands
 
+### System detection
+
+```bash
+turboquant setup
+```
+
+Detects your GPU, VRAM, CUDA version, Python/PyTorch/Transformers versions,
+HuggingFace token status, and recommends models and bit widths for your hardware.
+
 ### Show library info
 
 ```bash

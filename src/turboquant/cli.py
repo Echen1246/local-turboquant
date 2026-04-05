@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import platform
+import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +109,156 @@ def _handle_info(args) -> int:
     print("  --use-qjl-keys      Enable Q_prod (QJL sign sketch for keys)")
     print("  --quantize-decode    Quantize decode-phase tokens too")
     print("  --no-norm-guard      Disable per-layer norm guard (paper-faithful)")
+    return 0
+
+
+def _gpu_info() -> dict[str, Any]:
+    """Detect GPU hardware and CUDA availability."""
+    info: dict[str, Any] = {"cuda_available": False, "devices": []}
+    try:
+        import torch
+        info["cuda_available"] = torch.cuda.is_available()
+        info["cuda_version"] = getattr(torch.version, "cuda", None)
+        info["torch_version"] = torch.__version__
+        if torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            for i in range(count):
+                props = torch.cuda.get_device_properties(i)
+                total_gb = props.total_mem / (1024**3)
+                info["devices"].append({
+                    "index": i,
+                    "name": props.name,
+                    "total_memory_gb": round(total_gb, 1),
+                    "compute_capability": f"{props.major}.{props.minor}",
+                })
+    except ImportError:
+        info["torch_version"] = None
+    return info
+
+
+def _model_recommendations(vram_gb: float) -> list[str]:
+    """Suggest models and settings based on available VRAM."""
+    recs = []
+    if vram_gb >= 80:
+        recs.append("QwQ-32B / Llama-3.1-70B at 3-bit (full context)")
+    if vram_gb >= 48:
+        recs.append("Llama-3.1-8B at 3-bit (100K+ context)")
+        recs.append("Qwen-2.5-7B at 4-bit (long context)")
+    if vram_gb >= 24:
+        recs.append("Llama-3.1-8B at 4-bit (up to ~73K context)")
+        recs.append("Qwen-2.5-7B at 3-bit (up to ~40K context)")
+    if vram_gb >= 16:
+        recs.append("Llama-3.1-8B at 3-bit (up to ~32K context)")
+    if vram_gb >= 8:
+        recs.append("Qwen-2.5-0.5B at 4-bit (small model, testing)")
+    if not recs:
+        recs.append("Consider using Modal for cloud GPU access")
+    return recs
+
+
+def _handle_setup(args) -> int:
+    from turboquant import __version__
+
+    gpu = _gpu_info()
+
+    if args.json:
+        _print_json({
+            "version": __version__,
+            "python": sys.version,
+            "platform": platform.platform(),
+            "arch": platform.machine(),
+            "gpu": gpu,
+            "hf_token_set": bool(
+                os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+            ),
+            "hf_cache_dir": os.environ.get("HF_HOME", "~/.cache/huggingface"),
+            "tested_models": _TESTED_MODELS,
+        })
+        return 0
+
+    w = shutil.get_terminal_size((80, 24)).columns
+    bar = "─" * min(w, 60)
+
+    print()
+    print(f"  TurboQuant v{__version__}")
+    print(f"  KV cache compression for HuggingFace Transformers")
+    print(bar)
+
+    print()
+    print("  System")
+    print(f"    Python:     {sys.version.split()[0]}")
+    print(f"    Platform:   {platform.platform()}")
+    print(f"    Arch:       {platform.machine()}")
+
+    if gpu.get("torch_version"):
+        print(f"    PyTorch:    {gpu['torch_version']}")
+    else:
+        print("    PyTorch:    not installed")
+
+    try:
+        import transformers
+        print(f"    Transformers: {transformers.__version__}")
+    except ImportError:
+        print("    Transformers: not installed")
+
+    print()
+    print("  GPU")
+    if gpu["cuda_available"] and gpu["devices"]:
+        print(f"    CUDA:       {gpu.get('cuda_version', 'unknown')}")
+        for dev in gpu["devices"]:
+            print(f"    Device {dev['index']}:   {dev['name']}")
+            print(f"                {dev['total_memory_gb']} GB VRAM"
+                  f"  (compute {dev['compute_capability']})")
+    elif platform.system() == "Darwin":
+        print("    CUDA:       not available (macOS)")
+        print("    Note:       CPU-only mode — use Modal for GPU inference")
+    else:
+        print("    CUDA:       not available")
+        print("    Note:       TurboQuant requires an NVIDIA GPU for real inference")
+
+    print()
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    hf_cache = os.environ.get("HF_HOME", "~/.cache/huggingface")
+    print("  HuggingFace")
+    if hf_token:
+        masked = hf_token[:5] + "..." + hf_token[-4:]
+        print(f"    Token:      {masked}")
+    else:
+        print("    Token:      not set")
+        print("                Set HF_TOKEN for gated model access (Llama, Gemma, etc.)")
+    print(f"    Cache:      {hf_cache}")
+
+    print()
+    print("  Quantization")
+    print("    Modes:      qmse_packed (recommended), qmse, baseline")
+    print("    Bit widths: 4-bit (near-lossless), 3-bit (very good), 2-bit (experimental)")
+    print("    Kernel:     pure PyTorch (Triton kernel in development)")
+
+    if gpu["cuda_available"] and gpu["devices"]:
+        max_vram = max(d["total_memory_gb"] for d in gpu["devices"])
+        recs = _model_recommendations(max_vram)
+        print()
+        print(f"  Recommended for {max_vram} GB VRAM")
+        for r in recs:
+            print(f"    - {r}")
+
+    print()
+    print("  Tested models")
+    for m in _TESTED_MODELS:
+        status_icon = "+" if m["status"] == "fully working" else "~"
+        print(f"    [{status_icon}] {m['id']}")
+        print(f"        {m['notes']}")
+
+    print()
+    print("  Quick start")
+    print("    turboquant run \\")
+    print("      --model meta-llama/Llama-3.1-8B-Instruct \\")
+    print("      --bits 4 --prompt \"Hello\" --show-telemetry")
+    print()
+    print(f"  See models.md for known issues and work in progress.")
+    print(bar)
+    print()
+
     return 0
 
 
@@ -283,6 +437,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="TurboQuant-style KV-cache compression for Hugging Face Transformers.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    setup_parser = subparsers.add_parser(
+        "setup", help="Detect GPU, show system info, and recommend settings."
+    )
+    setup_parser.add_argument("--json", action="store_true", help="Print as JSON.")
+    setup_parser.set_defaults(func=_handle_setup)
 
     info_parser = subparsers.add_parser(
         "info", help="Show supported quantization settings, bit widths, and tested models."

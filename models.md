@@ -61,13 +61,36 @@ the same configuration works across model families.
 
 ## TODO
 
-- [ ] **Triton kernel for fused attention from packed data** — reads packed
+### Triton kernel (priority)
+
+- [ ] **Fused Triton attention kernel from packed data** — reads packed
   indices/signs directly in shared memory, never materializing full K/V. This
-  would give both memory AND speed improvements, eliminating the current latency
-  penalty from pure-PyTorch chunked attention. The spec is the existing
+  would give both memory AND speed improvements, eliminating the current ~5x
+  latency penalty from pure-PyTorch chunked attention. The spec is the existing
   `chunked_turboquant_attention()` function in `src/turboquant/runtime/attention.py`.
-- [ ] Test on Ministral-7B (paper's other validated model)
-- [ ] Test on larger models (70B+ class) where KV cache dominates VRAM
-- [ ] Benchmark on LongBench / NIAH at scale for quality validation
+  Current pure-PyTorch decode at 73K tokens: 29.4s vs 6.0s baseline.
+
+### Model testing
+
+- [ ] **DeepSeek-R1** — MLA (Multi-head Latent Attention) uses a compressed
+  latent KV representation. Need to verify TurboQuant interacts correctly with
+  MLA's already-compressed KV structure. DeepSeek may have its own norm
+  pathologies similar to Qwen.
+- [ ] **DeepSeek-V3** — same MLA architecture, different scale
+- [ ] **Gemma 2 / Gemma 3** — Google's model family, mentioned in the TurboQuant
+  blog post but not in the paper. Likely well-behaved norms.
+- [ ] **Ministral-7B** — paper's other validated model, should work cleanly
+- [ ] **Llama 3.3-70B** — test at scale where KV cache dominates VRAM
+- [ ] **Phi-4** — Microsoft's small model, different architecture patterns
+
+### Benchmarks
+
+- [ ] LongBench / LongBench-E at scale for quality validation
+- [ ] NIAH grid at 100K+ tokens (paper tests up to 104K)
+- [ ] RULER (long-context stress test beyond simple retrieval)
+
+### Features
+
 - [ ] Adaptive per-layer bit allocation (more bits for high-norm layers instead
   of binary dense/quantized)
+- [ ] Streaming quantization (quantize during prefill rather than after)
