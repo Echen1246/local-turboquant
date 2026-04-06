@@ -473,6 +473,8 @@ class SmokeRunner:
         output_ids = model.generate(inputs["input_ids"], max_new_tokens=32)
         text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
+        turboquant.print_telemetry(model)
+
         telemetry = turboquant.last_telemetry(model)
         metrics = turboquant.last_metrics(model)
 

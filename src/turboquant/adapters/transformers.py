@@ -295,6 +295,13 @@ class TurboQuantSession:
             return None
         return summarize_generation_metrics(self._last_output.metrics).to_dict()
 
+    def print_telemetry(self) -> None:
+        if self._last_output is None:
+            print("[TurboQuant] No generation data yet.")
+            return
+        telem = summarize_generation_metrics(self._last_output.metrics)
+        print(telem.format(compact=False))
+
     def compatibility_report(self) -> dict[str, Any]:
         return self.compatibility.to_dict()
 
@@ -389,9 +396,6 @@ def activate(
             inputs["attention_mask"] = attention_mask
 
         tq.call_count += 1
-        mode = "Q_prod" if tq.use_qjl_keys else "Q_mse"
-        if not quiet:
-            print(f"[TurboQuant] {tq.bits}-bit {mode} active | call #{tq.call_count}")
 
         output = greedy_decode_with_prefill_cache(
             model=model,
@@ -409,7 +413,11 @@ def activate(
         )
 
         model._tq_last_output = output
-        prompt_len = input_ids.shape[-1]
+
+        if not quiet:
+            telem = summarize_generation_metrics(output.metrics)
+            print(telem.format(compact=True))
+
         completion_ids = tok.encode(output.text, add_special_tokens=False)
         full_ids = torch.cat([
             input_ids[0],
@@ -468,8 +476,18 @@ def last_metrics(model) -> dict[str, Any] | None:
 
 
 def last_telemetry(model) -> dict[str, Any] | None:
-    """Get telemetry summary from the last TurboQuant generate() call."""
+    """Get telemetry summary from the last TurboQuant generate() call as a dict."""
     output = getattr(model, "_tq_last_output", None)
     if output is None:
         return None
     return summarize_generation_metrics(output.metrics).to_dict()
+
+
+def print_telemetry(model) -> None:
+    """Print a formatted telemetry summary from the last generate() call."""
+    output = getattr(model, "_tq_last_output", None)
+    if output is None:
+        print("[TurboQuant] No generation data yet.")
+        return
+    telem = summarize_generation_metrics(output.metrics)
+    print(telem.format(compact=False))

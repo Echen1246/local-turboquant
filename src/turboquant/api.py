@@ -11,6 +11,7 @@ from turboquant.adapters.transformers import (
     last_metrics,
     last_telemetry,
     load_transformers_model,
+    print_telemetry,
 )
 from turboquant.telemetry import TelemetrySummary, summarize_generation_metrics
 
@@ -26,5 +27,6 @@ __all__ = [
     "last_metrics",
     "last_telemetry",
     "load_transformers_model",
+    "print_telemetry",
     "summarize_generation_metrics",
 ]

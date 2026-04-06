@@ -6,6 +6,17 @@ from typing import Any
 from turboquant.runtime.generation import GenerationMetrics
 
 
+def _fmt_bytes(num_bytes: int | float | None) -> str:
+    if num_bytes is None:
+        return "n/a"
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
 @dataclass(frozen=True)
 class TelemetrySummary:
     variant: str
@@ -26,6 +37,62 @@ class TelemetrySummary:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def format(self, compact: bool = False) -> str:
+        """Return a human-readable multi-line summary string."""
+        if compact:
+            return self._format_compact()
+        return self._format_full()
+
+    def _format_compact(self) -> str:
+        savings = f"{self.payload_savings_percent:.1f}%" if self.payload_savings_percent else "n/a"
+        gen_s = f"{self.generation_seconds:.2f}s"
+        quant_s = f"{self.quantization_seconds:.3f}s"
+        tok_s = (
+            f"{self.completion_tokens / self.generation_seconds:.1f} tok/s"
+            if self.generation_seconds > 0
+            else "n/a"
+        )
+        mode = f"{self.qmse_bits}-bit" if self.qmse_bits else self.variant
+        return f"[TurboQuant] {mode} | {savings} savings | {gen_s} ({tok_s}) | quant {quant_s}"
+
+    def _format_full(self) -> str:
+        lines: list[str] = []
+        lines.append("")
+        lines.append("  TurboQuant Telemetry")
+        lines.append("  " + "─" * 50)
+
+        mode = f"{self.qmse_bits}-bit {self.variant}" if self.qmse_bits else self.variant
+        savings = f"{self.payload_savings_percent:.1f}%" if self.payload_savings_percent else "n/a"
+        tok_s = (
+            f"{self.completion_tokens / self.generation_seconds:.1f}"
+            if self.generation_seconds > 0
+            else "n/a"
+        )
+
+        lines.append("")
+        lines.append(f"    Mode:               {mode}")
+        lines.append(f"    KV savings:         {savings}")
+        lines.append(f"    Generation:         {self.generation_seconds:.2f}s  ({tok_s} tok/s)")
+        lines.append(f"    Quantization:       {self.quantization_seconds:.3f}s")
+
+        lines.append("")
+        lines.append(f"    Prompt tokens:      {self.prompt_tokens}")
+        lines.append(f"    Completion tokens:  {self.completion_tokens}")
+
+        lines.append("")
+        lines.append(f"    Dense KV cache:     {_fmt_bytes(self.dense_kv_bytes)}")
+        packed = self.packed_actual_bytes or self.packed_estimate_bytes
+        lines.append(f"    Packed KV cache:    {_fmt_bytes(packed)}")
+
+        if self.post_cache_setup_allocated_bytes is not None:
+            lines.append("")
+            lines.append(f"    GPU after setup:    {_fmt_bytes(self.post_cache_setup_allocated_bytes)}")
+        if self.peak_allocated_bytes is not None:
+            lines.append(f"    GPU peak:           {_fmt_bytes(self.peak_allocated_bytes)}")
+
+        lines.append("")
+        return "\n".join(lines)
 
 
 def summarize_generation_metrics(metrics: GenerationMetrics | dict[str, Any]) -> TelemetrySummary:

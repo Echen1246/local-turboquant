@@ -39,6 +39,7 @@ fitting on a 24 GB consumer GPU vs needing 32 GB+.
 - Norm guard automatically detects these layers and keeps them dense (3/28)
 - With norm guard: 3-bit Q_prod produces coherent output, 71.5% savings
 - Q_mse (without QJL) also works well with norm guard
+- Note: This method was explicitly NOT used in the paper but is a temporary stop-gap until I can find more root cause as to why Qwen models sputter with TQ, while it works for Llama. 
 
 **Why the paper didn't hit this:** the paper tested on Llama-3.1-8B and
 Ministral-7B, which don't have Qwen's "massive activation" pathology.
@@ -57,7 +58,8 @@ the same configuration works across model families.
   variance. Recommend `num_outlier_channels=0` for Q_prod.
 - **Decode speed tradeoff**: chunked online-softmax attention in pure PyTorch is
   ~2-5x slower than fused CUDA SDPA. Acceptable for VRAM-constrained users;
-  will be addressed by Triton kernel.
+  will be addressed by Triton kernel. Might take time.
+- **Long Context is untested beyond 80k tokens, will either use more expansive NIAH or LongBench or take advantage of an API to help verify output integrity at 100k and beyond windows at 98.3 3-bit and 99.5 4-bit. Want to see how even 0.5 offset can build up long term.
 
 ## TODO
 
