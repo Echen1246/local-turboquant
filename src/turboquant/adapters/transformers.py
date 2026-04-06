@@ -43,12 +43,15 @@ def load_transformers_model(config: TransformersLoadConfig):
         cache_dir=config.cache_dir,
         trust_remote_code=config.trust_remote_code,
     )
+    torch_dtype = config.dtype
+    if isinstance(torch_dtype, str) and torch_dtype != "auto":
+        torch_dtype = getattr(torch, torch_dtype, torch_dtype)
     model = AutoModelForCausalLM.from_pretrained(
         config.model_id_or_path,
         revision=config.revision,
         token=config.token,
         cache_dir=config.cache_dir,
-        dtype=config.dtype,
+        torch_dtype=torch_dtype,
         device_map=config.device_map,
         attn_implementation=config.attn_implementation,
         low_cpu_mem_usage=True,
