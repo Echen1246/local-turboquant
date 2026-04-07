@@ -45,16 +45,16 @@ class TelemetrySummary:
         return self._format_full()
 
     def _format_compact(self) -> str:
-        savings = f"{self.payload_savings_percent:.1f}%" if self.payload_savings_percent else "n/a"
-        gen_s = f"{self.generation_seconds:.2f}s"
-        quant_s = f"{self.quantization_seconds:.3f}s"
-        tok_s = (
-            f"{self.completion_tokens / self.generation_seconds:.1f} tok/s"
-            if self.generation_seconds > 0
-            else "n/a"
+        dense_mb = self.dense_kv_bytes / (1024 * 1024)
+        packed = self.packed_actual_bytes or self.packed_estimate_bytes
+        packed_mb = packed / (1024 * 1024) if packed else 0
+        savings = f"{self.payload_savings_percent:.0f}% saved" if self.payload_savings_percent else ""
+        peak_gb = f" | peak {self.peak_allocated_bytes / 1e9:.1f} GB" if self.peak_allocated_bytes else ""
+        return (
+            f"[TurboQuant] {self.prompt_tokens}\u2192{self.completion_tokens} tok"
+            f" | KV {dense_mb:.0f}\u2192{packed_mb:.0f} MB ({savings})"
+            f"{peak_gb}"
         )
-        mode = f"{self.qmse_bits}-bit" if self.qmse_bits else self.variant
-        return f"[TurboQuant] {mode} | {savings} savings | {gen_s} ({tok_s}) | quant {quant_s}"
 
     def _format_full(self) -> str:
         lines: list[str] = []
