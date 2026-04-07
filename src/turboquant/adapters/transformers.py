@@ -424,10 +424,6 @@ def activate(
 
         model._tq_last_output = output
 
-        if not quiet:
-            telem = summarize_generation_metrics(output.metrics)
-            print(telem.format(compact=True))
-
         completion_ids = tok.encode(output.text, add_special_tokens=False)
         full_ids = torch.cat([
             input_ids[0],
@@ -493,11 +489,15 @@ def last_telemetry(model) -> dict[str, Any] | None:
     return summarize_generation_metrics(output.metrics).to_dict()
 
 
-def print_telemetry(model) -> None:
-    """Print a formatted telemetry summary from the last generate() call."""
+def print_telemetry(model, *, verbose: bool = False) -> None:
+    """Print telemetry from the last generate() call.
+
+    Default is a one-liner with KV reduction and peak VRAM.
+    Pass ``verbose=True`` for the full breakdown.
+    """
     output = getattr(model, "_tq_last_output", None)
     if output is None:
         print("[TurboQuant] No generation data yet.")
         return
     telem = summarize_generation_metrics(output.metrics)
-    print(telem.format(compact=False))
+    print(telem.format(compact=not verbose))
