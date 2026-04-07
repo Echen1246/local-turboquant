@@ -334,22 +334,27 @@ def activate(
     rotation_seed: int = 0,
     num_outlier_channels: int = 0,
     outlier_extra_bits: int = 1,
-    use_qjl_keys: bool = False,
-    quantize_decode: bool = False,
+    use_qjl_keys: bool = True,
+    quantize_decode: bool = True,
     norm_guard: bool = True,
     quiet: bool = False,
 ) -> None:
     """Activate TurboQuant on an existing HuggingFace model.
 
-    After calling this, ``model.generate()`` transparently compresses the
-    KV cache. No other code changes are needed.
+    After calling this, every ``model.generate()`` call transparently
+    compresses the KV cache.  The user's own ``max_new_tokens``,
+    ``attention_mask``, and other generate kwargs pass through unchanged.
+
+    Call ``turboquant.deactivate(model)`` to restore the original behavior.
 
     Args:
         model: A HuggingFace ``AutoModelForCausalLM`` instance.
-        tokenizer: Optional tokenizer. If not provided, one will be loaded
-            from the model's ``name_or_path``.
-        bits: Quantization bit width (2, 3, or 4).
-        quiet: If True, suppress the activation banner.
+        tokenizer: Optional tokenizer (auto-loaded from model if omitted).
+        bits: Quantization bit width (2, 3, or 4). Default: 4.
+        use_qjl_keys: Use Q_prod (paper-accurate). Default: True.
+        quantize_decode: Re-quantize generated tokens. Default: True.
+        norm_guard: Auto-detect high-norm layers and keep them dense.
+        quiet: Suppress the activation banner.
     """
     if hasattr(model, "_tq_state"):
         raise RuntimeError(
