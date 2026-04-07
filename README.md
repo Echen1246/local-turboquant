@@ -1,14 +1,12 @@
 <img width="246" height="50" alt="Screenshot 2026-04-06 at 8 53 35 PM" src="https://github.com/user-attachments/assets/78510409-d458-40a9-829e-6f59d3c7b2b6" />
 
-KV cache compression for HuggingFace Transformers. Reduces VRAM usage
-by ~74% for long-context inference using DeepMind's TurboQuant algorithm
-(ICLR 2026), with a fused Triton attention kernel.
+KV cache compression for HuggingFace Transformers. Drop-in ~74% VRAM
+reduction for long-context inference, based on DeepMind's TurboQuant
+(ICLR 2026).
 
-> **Research details:** Algorithm math, Q_prod vs Q_mse, kernel design,
-> benchmarks, and tradeoffs → [research/README.md](research/README.md)
->
-> **Model support:** Tested models, known issues, Triton status →
-> [models.md](models.md)
+> [research/README.md](research/README.md) — algorithm, kernel design, benchmarks
+> | [models.md](models.md) — tested models, known issues
+> | [remote_setup.md](remote_setup.md) — Vast.ai, Lambda, Modal, Colab
 
 ---
 
@@ -18,32 +16,21 @@ by ~74% for long-context inference using DeepMind's TurboQuant algorithm
 pip install git+https://github.com/Echen1246/local-turboquant.git
 ```
 
-Or for development:
-
-```bash
-git clone https://github.com/Echen1246/local-turboquant.git
-cd local-turboquant
-pip install -e ".[dev]"
-```
-
-### Requirements
-
-- Python 3.11+
-- NVIDIA GPU with CUDA (for real inference)
-- Triton (auto-installed, enables fused kernel)
-
-**Cloud GPUs (Vast.ai, Lambda, Modal):** see [remote_setup.md](remote_setup.md).
+Requires Python 3.11+ and an NVIDIA GPU with CUDA.
 
 ---
 
-## Quick start
+## Usage
 
-### Attach to any Transformers model
+TurboQuant hooks into your existing Transformers code. One line to
+activate, then use `model.generate()` normally — no changes to your
+prompts, tokenizer, or generation config.
 
 ```python
 import turboquant
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# Load any HuggingFace model as usual
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
 model = AutoModelForCausalLM.from_pretrained(
     "meta-llama/Llama-3.1-8B-Instruct",
@@ -51,164 +38,140 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype="auto",
 )
 
-# One line — all subsequent generate() calls use compressed KV cache
-turboquant.activate(model, tokenizer, bits=4)
+# Activate — all generate() calls now use compressed KV cache
+turboquant.activate(model, tokenizer)
+```
 
-# Use model.generate() exactly as before
+That's it. Everything after `activate()` works exactly like normal
+Transformers:
+
+```python
 inputs = tokenizer("What is KV cache compression?", return_tensors="pt").to("cuda")
 output = model.generate(inputs.input_ids, max_new_tokens=1024)
 print(tokenizer.decode(output[0], skip_special_tokens=True))
 
-# Check compression stats
-print(turboquant.last_telemetry(model))
-# → {'payload_savings_percent': 73.8, ...}
+# Works with chat templates, system prompts, generation configs — anything
+messages = [{"role": "user", "content": "Explain attention mechanisms."}]
+inputs = tokenizer.apply_chat_template(messages, return_tensors="pt").to("cuda")
+output = model.generate(inputs, max_new_tokens=512, temperature=0.7, do_sample=True)
+print(tokenizer.decode(output[0], skip_special_tokens=True))
 
-# Detach when done
-turboquant.deactivate(model)
+# Check compression stats anytime
+print(turboquant.last_telemetry(model))
+# → {'payload_savings_percent': 73.8, 'dense_kv_bytes': ..., 'packed_actual_bytes': ...}
 ```
 
-That's it. Every `model.generate()` call automatically compresses the KV
-cache. No changes to your prompting code, tokenizer setup, or generation
-config.
-
-### Session API (more control)
+To go back to normal:
 
 ```python
-from turboquant import TurboQuantSession
-
-session = TurboQuantSession.from_pretrained(
-    "meta-llama/Llama-3.1-8B-Instruct",
-    bits=4,
-    device_map="auto",
-)
-print(session.generate("Explain quantum computing.", max_new_tokens=1024))
-print(session.last_telemetry())
+turboquant.deactivate(model)
+# model.generate() is now the original, uncompressed version
 ```
+
+### What activate() does
+
+- Saves the original `model.generate` method
+- Replaces it with a wrapper that compresses the KV cache using
+  TurboQuant's fused Triton kernel
+- Your `max_new_tokens`, `temperature`, `attention_mask`, etc. all
+  pass through unchanged — TurboQuant imposes no limits
+- `deactivate()` restores the original method
+
+### Options
+
+```python
+turboquant.activate(model, tokenizer)              # 4-bit Q_prod (default)
+turboquant.activate(model, tokenizer, bits=3)       # 3-bit, more compression
+turboquant.activate(model, tokenizer, use_qjl_keys=False)  # Q_mse instead of Q_prod
+```
+
+| Parameter | Default | What it does |
+|-----------|---------|--------------|
+| `bits` | 4 | Quantization width (4 = near-lossless, 3 = very good) |
+| `use_qjl_keys` | True | Q_prod (paper-accurate unbiased logits) |
+| `quantize_decode` | True | Re-quantize generated tokens into packed cache |
+| `norm_guard` | True | Auto-keep high-norm layers dense (needed for Qwen) |
 
 ---
 
 ## CLI
 
-### Welcome / help
+For quick testing without writing Python:
 
 ```bash
-turboquant
-```
-
-### Run a prompt
-
-```bash
-# Defaults: Llama 3.1 8B, 4-bit Q_prod, telemetry shown
+# One-shot prompt (defaults to Llama 3.1 8B, 4-bit Q_prod)
 turboquant run --prompt "Explain KV cache compression."
 
-# Custom model, 3-bit
-turboquant run --model Qwen/Qwen2.5-7B-Instruct --bits 3 --prompt "Hello"
-
-# Q_mse instead of Q_prod
-turboquant run --no-qjl --prompt "Hello"
-
-# JSON output (for scripting)
-turboquant run --prompt "Hello" --json
-```
-
-### Interactive session
-
-```bash
+# Interactive REPL
 turboquant attach
 
-# Or with a different model / generation cap
-turboquant attach --model Qwen/Qwen2.5-7B-Instruct --bits 3 --max-new-tokens 2048
-```
-
-Default `--max-new-tokens` matches the session API (see `turboquant.constants.DEFAULT_MAX_NEW_TOKENS`). Inside the REPL, type `/tokens N` or `/help`.
-
-Loads the model once, then gives you an interactive prompt:
-
-```
-  ✓ TurboQuant 4-bit Q_prod active
-  Type a prompt and press Enter. Ctrl+C or 'exit' to quit.
-
-> What is attention?
-[response]
-[TurboQuant] 74% KV saved | 3871 MB freed | 16.3 tok/s
-
-> /stats       # show last telemetry
-> /tokens 512  # change max generation length
-> /help        # list commands
-```
-
-### System info
-
-```bash
+# System info (GPU, VRAM, Triton, recommendations)
 turboquant setup
-```
 
-Detects GPU, VRAM, CUDA version, Triton availability, and recommends
-models + bit widths for your hardware.
+# Different model or bit width
+turboquant run --model Qwen/Qwen2.5-7B-Instruct --bits 3 --prompt "Hello"
+```
 
 ---
 
-## Defaults
+## What gets installed
 
-| Setting | Default | Override |
-|---------|---------|----------|
-| Model | `meta-llama/Llama-3.1-8B-Instruct` | `--model <id>` |
-| Bits | 4 | `--bits 3` |
-| Algorithm | Q_prod (3-bit MSE keys + 1-bit QJL) | `--no-qjl` for Q_mse |
-| Decode quant | On (re-quantize generated tokens) | `--no-quantize-decode` |
-| Max tokens | 256 | `--max-new-tokens N` |
+Only the `turboquant` Python package (`src/turboquant/`). The `research/`,
+`examples/`, docs, and notebooks are NOT included in the pip install —
+they live in the repo for reference but don't ship with the library.
 
-### Bit width guide
-
-| Bits | Quality | KV savings | Notes |
-|------|---------|------------|-------|
-| 4 | Near-lossless (cosine sim ~0.995) | ~74% | Recommended default |
-| 3 | Very good (cosine sim ~0.983) | ~80% | VRAM-constrained setups |
-| 2 | Experimental | ~87% | Visibly lossy |
-
----
-
-## HuggingFace token
-
-Gated models (Llama, Gemma) require accepting the license on HuggingFace
-and setting a token:
-
-```bash
-export HF_TOKEN="hf_your_token_here"
 ```
+pip package:
+  turboquant/
+    quantization/     Core TurboQuant_mse algorithm
+    runtime/          Packed cache, Triton kernel, attention, generation
+    adapters/         HuggingFace Transformers integration
+    cli.py            CLI entry point
+    api.py            Public API (activate, deactivate, etc.)
 
-Or pass directly: `turboquant run --token hf_your_token_here --prompt "Hi"`
+repo only (not installed):
+  research/           Algorithm research, QwQ-32B benchmarks
+  examples/           Smoke tests, Colab notebooks, Modal scripts
+  models.md           Tested models and known issues
+  remote_setup.md     Cloud GPU setup guides
+```
 
 ---
 
 ## Tested models
 
-| Model | Status | Notes |
-|-------|--------|-------|
-| Llama 3.1 8B Instruct | Fully working | 74% savings, all layers quantize cleanly |
-| Qwen 2.5 7B Instruct | Works with norm guard | 3/28 layers kept dense, 71.5% savings |
+| Model | Status | Savings |
+|-------|--------|---------|
+| Llama 3.1 8B Instruct | Fully working | 74% |
+| Qwen 2.5 7B Instruct | Works with norm guard | 71.5% |
 
-See [models.md](models.md) for details, known issues, and work in progress.
+See [models.md](models.md) for details.
+
+---
+
+## HuggingFace token
+
+Gated models (Llama, Gemma) need a token:
+
+```bash
+export HF_TOKEN="hf_your_token_here"
+```
 
 ---
 
 ## Troubleshooting
 
-**Gated repo error** — Accept the model license on HuggingFace and set `HF_TOKEN`.
+**Gated repo error** — Accept the license on HuggingFace and set `HF_TOKEN`.
 
-**CUDA OOM** — Try `--bits 3`, reduce `--max-new-tokens`, or use a smaller model.
+**CUDA OOM** — Try `bits=3` or a shorter context.
 
-**Slow generation** — Expected tradeoff: TurboQuant trades decode latency
-for VRAM. At long contexts (32K+), the fused Triton kernel runs at ~2x
-baseline. The latency gap narrows as context grows because the VRAM
-savings increasingly matter.
-
-**No module 'turboquant'** — Activate your venv and run `pip install -e .`
+**Slow generation** — Expected: ~2x baseline latency at long context.
+TurboQuant trades decode speed for VRAM savings.
 
 ---
 
 ## Paper
 
-- TurboQuant: https://openreview.net/forum?id=tO3ASKZlok
-- QJL: https://arxiv.org/abs/2406.03482
-- Google Research blog: https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/
+- [TurboQuant (ICLR 2026)](https://openreview.net/forum?id=tO3ASKZlok)
+- [QJL](https://arxiv.org/abs/2406.03482)
+- [Google Research blog](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
