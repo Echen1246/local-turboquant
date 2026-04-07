@@ -141,12 +141,7 @@ repo only (not installed):
 
 ## Tested models
 
-| Model | Status | Savings |
-|-------|--------|---------|
-| Llama 3.1 8B Instruct | Fully working | 74% |
-| Qwen 2.5 7B Instruct | Works with norm guard | 71.5% |
-
-See [models.md](models.md) for details.
+See [models.md](models.md) for supported models, known issues, and work in progress.
 
 ---
 
