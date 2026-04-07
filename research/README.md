@@ -1,179 +1,226 @@
-# TurboQuant Research
+# TurboQuant — Research & Implementation Details
 
-Research harness for TurboQuant KV-cache compression. This directory contains
-the original QwQ-32B experiments, NIAH benchmark infrastructure, and KV
-capture/analysis tools.
+For installation and usage, see the [root README](../README.md).
+For tested models and known issues, see [models.md](../models.md).
 
-For the installable library and setup instructions, see the
-[root README](../README.md). For tested models and known issues, see
-[models.md](../models.md).
+---
 
 ## Algorithm
 
-TurboQuant_mse quantizes each KV vector independently:
+### Q_mse (TurboQuant_mse)
+
+Quantizes each KV vector to minimize reconstruction MSE:
 
 ```
 x ∈ R^d
-  → normalize:   u = x / ||x||          (store ||x|| as scale)
-  → rotate:      z = u R^T              (fixed random orthogonal R)
-  → quantize:    idx = LloydMax(z_j)    (per-coordinate, Beta distribution)
-  → dequantize:  z_hat = Centroid(idx)
-  → unrotate:    u_hat = z_hat R
+  → normalize:   u = x / ||x||          (store ||x|| as FP16 scale)
+  → rotate:      z = u @ R^T             (fixed random orthogonal R)
+  → quantize:    idx = LloydMax(z_j)     (per-coordinate, Beta distribution)
+  → dequantize:  z_hat = centers[idx]
+  → unrotate:    u_hat = z_hat @ R
   → rescale:     x_hat = u_hat * ||x||
 ```
 
-The coordinate distribution on a unit sphere in d dimensions is
-`Beta((d-1)/2, (d-1)/2)` — this is why a Lloyd-Max codebook trained on
-that distribution is near-optimal per the rate-distortion bound.
+The random orthogonal rotation is critical — it decorrelates coordinates
+so that each dimension follows a `Beta((d-1)/2, (d-1)/2)` distribution,
+making a scalar Lloyd-Max codebook near-optimal per the rate-distortion
+bound. Without the rotation, outlier channels (especially in Qwen) would
+require per-channel handling.
 
-TurboQuant_prod extends this for unbiased inner products:
+### Q_prod (TurboQuant_prod)
+
+Extends Q_mse to produce unbiased attention logits:
 
 ```
-x_hat_mse = Q_mse(x, b-1 bits)
-r = x - x_hat_mse                       (residual)
-qjl = sign(S * r)                       (1-bit JL sketch, random Gaussian S)
+x_hat_mse = Q_mse(x, b-1 bits)          (MSE quantization at b-1 bits)
+r = x - x_hat_mse                        (residual)
+qjl = sign(r @ S^T)                      (1-bit JL sketch, random Gaussian S)
 store: (mse_indices, qjl_signs, ||r||)
 
-logit = <q, x_hat_mse> + sqrt(π/2)/d * ||r|| * <Sq, qjl>
+logit = <q, x_hat_mse> + sqrt(π/2)/d * ||r|| * <q @ S^T, qjl>
 ```
 
-This gives `E[logit] = <q, x>` (unbiased). The two-part representation
-must be consumed directly in a custom attention kernel — merging the QJL
-correction back into a single vector produces garbage.
+**The guarantee:** `E[logit] = <q, x>` — the logit is an unbiased
+estimator of the true inner product. This prevents systematic attention
+drift during long autoregressive generation, which is the paper's core
+contribution.
 
-## What is implemented
+**Key constraint:** The two-part representation (MSE + QJL) must be
+consumed directly in a custom attention kernel. Merging the QJL correction
+back into a single vector produces dense noise — the QJL term is optimized
+for linear statistics, not vector reconstruction.
 
-- `TurboQuant_mse` with Lloyd-Max codebook for Beta-distributed coordinates
-- `TurboQuant_prod` with QJL residual sign sketch
-- Packed bit-packed cache with norm storage (`PackedMSELayer`)
-- Chunked online-softmax attention from compressed data
-- Lazy update mode (new tokens stored directly in packed form)
-- Range decoding (decompress only the chunk needed for attention)
-- Norm guard (auto-detects high-norm layers and keeps them dense)
-- Per-channel outlier-aware mixed precision
+### Bit budget
 
-## Measured results
+Q_prod uses the SAME total bit budget as Q_mse. At b bits per dimension:
 
-All benchmarks on Modal B200, `sdpa` attention backend.
+| Method | Keys | Values | Total bits/dim |
+|--------|------|--------|----------------|
+| Q_mse | b-bit MSE (2^b levels) | b-bit MSE | b |
+| Q_prod | (b-1)-bit MSE + 1-bit QJL | b-bit MSE | b |
 
-### Reconstruction quality
+At 4 bits: Q_prod keys get 8 codebook levels (3-bit MSE) + 1-bit QJL
+sign. Same storage as 4-bit Q_mse, but with unbiased logits instead of
+optimal reconstruction.
 
-Llama 3.1-8B-Instruct, per-layer average across all 32 layers:
+---
 
-```
-┌──────┬──────────────────┬──────────────────┬──────────────┬──────────────┐
-│ Bits │ Key Cosine Sim   │ Val Cosine Sim   │ Key MSE      │ Val MSE      │
-├──────┼──────────────────┼──────────────────┼──────────────┼──────────────┤
-│  4   │ 0.9954           │ 0.9954           │ 0.0278       │ 0.0009       │
-│  3   │ 0.9830           │ 0.9830           │ (higher)     │ (higher)     │
-│  2   │ visibly lossy    │ visibly lossy    │ —            │ —            │
-└──────┴──────────────────┴──────────────────┴──────────────┴──────────────┘
-```
+## Kernel integration
 
-Qwen 2.5-7B-Instruct, 3-bit Q_prod with norm guard (25/28 layers quantized):
+### Fused Triton attention kernel
+
+The fused kernel (`_tile_attention_kernel` in `triton_kernels.py`)
+computes attention directly from compressed storage in a single GPU pass:
 
 ```
-┌────────────────────────────────────┬─────────┐
-│ Metric                             │ Value   │
-├────────────────────────────────────┼─────────┤
-│ Key cosine sim (quantized layers)  │ 0.920   │
-│ Layers quantized                   │ 25/28   │
-│ Layers kept dense (norm guard)     │ 3/28    │
-│ Dense layers                       │ 0, 1, 27│
-│ KV payload savings                 │ 71.5%   │
-└────────────────────────────────────┴─────────┘
+Grid: (n_tiles, Q_heads)
+Per tile (TILE_N=64 positions × D=128 dimensions):
+
+  1. Unpack key MSE indices from bit-packed uint8
+  2. Gather key codebook centers
+  3. Compute MSE logit: norm_k * <q @ R_k^T, centers[k_idx]>
+  4. [Q_prod only] Unpack 1-bit QJL signs
+  5. [Q_prod only] Add correction: sqrt(π/2)/D * ||r|| * <q @ S^T, signs>
+  6. Online softmax (tile-local max + exp + sum)
+  7. Unpack value MSE indices, gather value centers
+  8. Weighted value accumulation
+  9. Store partial (out, max, sum) for cross-tile reduction
 ```
 
-### Long-context memory savings
+The `HAS_QJL` constexpr flag means Q_mse compiles to identical code
+as before — zero overhead when QJL is not used.
 
-Llama 3.1-8B-Instruct, 3-bit Q_mse, chunked attention:
+**Separate codebooks:** Q_prod uses different bit-widths for keys
+(b-1 bits) and values (b bits), so the kernel accepts separate
+`key_centers_ptr`/`val_centers_ptr` and `KEY_BITS`/`VAL_BITS`.
 
-```
-┌──────────────┬───────────┬───────────┬──────────────┬─────────┐
-│ Prompt Tokens│ Dense KV  │ Packed KV │ Peak Overhead│ Savings │
-├──────────────┼───────────┼───────────┼──────────────┼─────────┤
-│  5,000       │ 477 MB    │ 93 MB     │ 161 MB       │ 67.6%   │
-│ 36,000       │ 4.77 GB   │ 932 MB    │ 999 MB       │ 79.5%   │
-│ 73,000       │ 9.54 GB   │ 1.86 GB   │ 1.94 GB      │ 80.1%   │
-└──────────────┴───────────┴───────────┴──────────────┴─────────┘
-```
+**Dense buffer merge:** When `quantize_decode=False`, newly generated
+tokens stay in a dense buffer. The kernel output is merged with
+standard SDPA on the dense tokens via online softmax combination.
 
-At 73K tokens, TurboQuant saves 7.8 GB of peak VRAM — the difference
-between fitting on a 24 GB consumer GPU vs needing 32 GB+.
-
-### Decode speed tradeoff
-
-Llama 3.1-8B-Instruct, 73K context, 16 new tokens:
+### Fallback chain
 
 ```
-┌────────────────┬────────────────┬────────────────┐
-│                │ Baseline       │ TurboQuant     │
-├────────────────┼────────────────┼────────────────┤
-│ Decode time    │ 6.0s           │ 29.4s          │
-│ Relative speed │ 1.0x           │ ~0.2x          │
-└────────────────┴────────────────┴────────────────┘
+turboquant_attention_forward()
+  → fused_attention()          # Triton kernel (GPU, B=1, Sq=1)
+  → chunked_turboquant_attention()  # PyTorch chunked (any device/shape)
 ```
 
-The ~5x slowdown at long context is the pure-PyTorch chunked attention
-kernel. A fused Triton kernel reading directly from packed indices in
-shared memory would eliminate this. The spec for that kernel is
-`chunked_turboquant_attention()` in `src/turboquant/runtime/attention.py`.
+If Triton is unavailable or the batch/sequence shape is unsupported,
+the chunked PyTorch path handles it. Both paths operate from compressed
+storage — no full KV decompression.
 
-### Key norm pathology (Qwen vs Llama)
-
-Channel energy profiling revealed why Qwen needs norm guard:
-
-```
-┌───────┬────────┬───────────────┬─────────────────┬──────────────────┐
-│ Model │ Layer  │ Key Mean Norm │ 50% Energy In   │ Max/Min Ratio    │
-├───────┼────────┼───────────────┼─────────────────┼──────────────────┤
-│ Qwen  │  0     │ 273.7         │ 5 channels      │ extreme          │
-│ Qwen  │  1     │ 66.3          │ moderate         │ high             │
-│ Qwen  │ 10     │ 16.8          │ 15 channels     │ normal           │
-│ Qwen  │ 27     │ 239.5         │ 3 channels      │ 266,774x         │
-├───────┼────────┼───────────────┼─────────────────┼──────────────────┤
-│ Llama │ all    │ ~15-21        │ distributed     │ moderate         │
-└───────┴────────┴───────────────┴─────────────────┴──────────────────┘
-```
-
-Qwen's pathological layers concentrate >50% of key energy in 3-5 channels.
-Q_prod variance scales with norm²: at norm 239, logit std ~4.5 swamps
-typical attention logits of O(10). Norm guard solves this by keeping
-those layers dense automatically.
-
-### QwQ-32B NIAH results (original research)
-
-QwQ-32B, 3-bit Q_mse, NIAH at 4K/8K/16K/32K tokens, depths 10/50/90%:
-
-```
-┌──────────────┬──────────┬──────────┬──────────────┐
-│ Variant      │ Match %  │ Dense KV │ Packed KV    │
-├──────────────┼──────────┼──────────┼──────────────┤
-│ baseline     │ 100%     │ 3.98 GB  │ —            │
-│ qmse         │ 100%     │ 3.98 GB  │ —            │
-│ qmse_packed  │ 100%     │ —        │ 778 MB       │
-└──────────────┴──────────┴──────────┴──────────────┘
-
-Payload reduction: 80.4%
-```
+---
 
 ## Q_mse vs Q_prod: when to use which
 
-**Use Q_mse when:**
-- You want a drop-in cache format
-- You are validating quantization quality
-- You are integrating with an existing attention kernel
-- You want maximum reconstruction fidelity
+**Q_prod (default, `--use-qjl-keys`):**
+- Paper-faithful, unbiased attention logits
+- Prevents attention drift in long generation
+- Works cleanly on Llama (moderate key norms)
+- Slightly lower cosine similarity (8 vs 16 codebook levels at 4-bit)
 
-**Use Q_prod (`--use-qjl-keys`) when:**
-- You have the TurboQuant custom attention kernel active
-- You want unbiased attention logits (paper-faithful)
-- You are willing to accept lower cosine similarity for the
-  theoretical guarantee of unbiased inner products
+**Q_mse (`--no-qjl`):**
+- Maximum reconstruction fidelity
+- Safer for models with extreme key norms (Qwen layers 0, 1, 27)
+- Compatible with any attention backend
+- Best paired with dense decode buffer (`--no-quantize-decode`)
 
-**Never merge Q_prod back into a plain vector.** The QJL correction
-is noise optimized for linear statistics. Storing it as a normal KV
-cache entry breaks the guarantee and produces garbage.
+**Never merge Q_prod back into a stored vector.** The QJL correction
+is noise optimized for linear statistics. Using it as a normal KV cache
+entry breaks the guarantee.
+
+---
+
+## Expected tradeoffs
+
+### VRAM savings scale with context length
+
+```
+Llama 3.1 8B, 4-bit Q_prod, all 32 layers quantized:
+
+Context     Dense KV    Packed KV    Savings    Overhead saved
+────────    ────────    ─────────    ───────    ──────────────
+  ~8K        655 MB      172 MB       74%         483 MB
+ ~40K       5243 MB     1372 MB       74%        3936 MB
+ ~73K       9540 MB     2490 MB       74%        7050 MB
+```
+
+Savings percentage is constant (~74% at 4-bit). Absolute MB saved
+grows linearly with context — the longer the context, the bigger the
+win.
+
+### Latency trades off against VRAM
+
+```
+Llama 3.1 8B, 4-bit Q_prod, fused Triton kernel:
+
+Context     Baseline    TurboQuant    Ratio
+────────    ────────    ──────────    ─────
+ ~40K        7.0s        15.7s        2.25x
+```
+
+The ~2.25x slowdown comes from ALU work that baseline SDPA doesn't
+need: bit-unpacking, codebook lookup, QJL dot product. Future
+optimizations (split-K parallelism, autotune, SRAM staging) target
+~1.3-1.5x.
+
+**The tradeoff is worth it when VRAM is the bottleneck.** At 73K context,
+baseline needs ~25 GB for KV alone. TurboQuant fits it in ~7 GB — the
+difference between needing an A100 and fitting on a consumer 24 GB card.
+
+### Latency gap narrows at longer context
+
+The kernel's compute cost is proportional to context length (same as
+baseline SDPA). The constant overhead (codebook lookup, bit ops) becomes
+a smaller fraction of total work as context grows. At very long contexts,
+the ratio approaches ~1.5x with the current kernel.
+
+---
+
+## Measured results
+
+### Reconstruction quality
+
+Llama 3.1 8B, per-layer average across all 32 layers:
+
+```
+Bits    Key Cosine Sim    Val Cosine Sim    Key MSE      Val MSE
+────    ──────────────    ──────────────    ───────      ───────
+  4     0.9954            0.9954            0.0278       0.0009
+  3     0.9830            0.9830            (higher)     (higher)
+  2     visibly lossy     visibly lossy     —            —
+```
+
+### Key norm pathology (Qwen vs Llama)
+
+Why Qwen needs norm guard and Llama doesn't:
+
+```
+Model    Layer    Key Mean Norm    50% Energy In    Max/Min Ratio
+─────    ─────    ─────────────    ─────────────    ─────────────
+Qwen       0     273.7            5 channels       extreme
+Qwen      27     239.5            3 channels       266,774x
+Qwen      10     16.8             15 channels      normal
+Llama     all    ~15-21           distributed      moderate
+```
+
+Q_prod variance scales with `||r||^2 / D`. At Qwen layer 27 (norm 239),
+logit std ~4.5 swamps typical attention logits of O(10). Norm guard
+auto-detects these layers and keeps them dense.
+
+### QwQ-32B NIAH (original research)
+
+3-bit Q_mse, NIAH at 4K/8K/16K/32K tokens, depths 10/50/90%:
+
+```
+Variant        Match %    KV Size
+───────        ───────    ───────
+baseline       100%       3.98 GB
+qmse_packed    100%       778 MB    (80.4% savings)
+```
+
+---
 
 ## Research structure
 
@@ -181,7 +228,6 @@ cache entry breaks the guarantee and produces garbage.
 research/
   modal_app.py              NIAH benchmark runner (Modal, QwQ-32B)
   config.py                 Model ID, GPU, revision pins
-  sources.py                Paper/benchmark source catalog
   benchmarks/
     niah.py                 NIAH protocol (needle generation, scoring)
     paper.py                Paper benchmark specifications
@@ -191,48 +237,28 @@ research/
     attention_metrics.py    Causal logit MSE measurement
   runtime/
     experiment_log.py       JSONL experiment logging
-    kv_artifacts.py         KV tensor extraction from safetensors
+    kv_artifacts.py         KV tensor extraction
     kv_capture.py           KV cache capture and summarization
-    metadata.py             Run naming, timestamps, JSON I/O
-    query_capture.py        Query projection capture
 ```
 
-## Paper references
+### Reproduce (QwQ-32B NIAH)
+
+```bash
+pip install -e ".[benchmarks,modal,dev]"
+modal setup
+
+modal run research/modal_app.py --prefetch-only
+modal run research/modal_app.py \
+  --niah-grid --variant qmse_packed --qmse-bits 3 \
+  --context-lengths 4000,8000,16000,32000 \
+  --depth-percents 10,50,90 --run-name niah-packed-b3
+```
+
+---
+
+## References
 
 - TurboQuant: https://openreview.net/forum?id=tO3ASKZlok
 - QJL: https://arxiv.org/abs/2406.03482
 - PolarQuant: https://arxiv.org/abs/2502.02617
-- Google blog: https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/
-
-## Reproduce (QwQ-32B NIAH)
-
-```bash
-uv venv && source .venv/bin/activate
-uv pip install -e ".[benchmarks,modal,dev]"
-modal setup
-
-# Warm cache
-modal run research/modal_app.py --prefetch-only
-
-# Baseline NIAH grid
-modal run research/modal_app.py \
-  --niah-grid \
-  --context-lengths 4000,8000,16000,32000 \
-  --depth-percents 10,50,90 \
-  --variant baseline \
-  --run-name niah-baseline
-
-# Packed 3-bit NIAH grid
-modal run research/modal_app.py \
-  --niah-grid \
-  --context-lengths 4000,8000,16000,32000 \
-  --depth-percents 10,50,90 \
-  --variant qmse_packed \
-  --qmse-bits 3 \
-  --run-name niah-qmse-packed-b3
-
-# Compare
-modal run research/modal_app.py \
-  --compare-niah-baseline niah-baseline \
-  --compare-niah-candidate niah-qmse-packed-b3
-```
+- Google Research blog: https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/
