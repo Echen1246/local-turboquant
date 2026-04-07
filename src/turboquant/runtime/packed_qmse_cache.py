@@ -174,6 +174,7 @@ class PackedMSELayer(CacheLayerMixin):
         quantize_decode: bool = False,
     ):
         super().__init__()
+        self.is_initialized = False
         self.bits = bits
         self.seed = seed
         self.grid_size = grid_size
