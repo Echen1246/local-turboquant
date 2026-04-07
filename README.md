@@ -76,6 +76,7 @@ turboquant.deactivate(model)
 - Your `max_new_tokens`, `temperature`, `attention_mask`, etc. all
   pass through unchanged — TurboQuant imposes no limits
 - `deactivate()` restores the original method
+<img width="1190" height="173" alt="image" src="https://github.com/user-attachments/assets/336b803a-6e6c-48fd-9725-7e352e71ef94" />
 
 ### Options
 
