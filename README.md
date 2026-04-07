@@ -32,6 +32,8 @@ pip install -e ".[dev]"
 - NVIDIA GPU with CUDA (for real inference)
 - Triton (auto-installed, enables fused kernel)
 
+**Cloud GPUs (Vast.ai, Lambda, Modal):** see [remote_setup.md](remote_setup.md).
+
 ---
 
 ## Quick start
@@ -54,7 +56,7 @@ turboquant.activate(model, tokenizer, bits=4)
 
 # Use model.generate() exactly as before
 inputs = tokenizer("What is KV cache compression?", return_tensors="pt").to("cuda")
-output = model.generate(inputs.input_ids, max_new_tokens=256)
+output = model.generate(inputs.input_ids, max_new_tokens=1024)
 print(tokenizer.decode(output[0], skip_special_tokens=True))
 
 # Check compression stats
@@ -79,7 +81,7 @@ session = TurboQuantSession.from_pretrained(
     bits=4,
     device_map="auto",
 )
-print(session.generate("Explain quantum computing.", max_new_tokens=256))
+print(session.generate("Explain quantum computing.", max_new_tokens=1024))
 print(session.last_telemetry())
 ```
 
@@ -114,9 +116,11 @@ turboquant run --prompt "Hello" --json
 ```bash
 turboquant attach
 
-# Or with a different model
-turboquant attach --model Qwen/Qwen2.5-7B-Instruct --bits 3
+# Or with a different model / generation cap
+turboquant attach --model Qwen/Qwen2.5-7B-Instruct --bits 3 --max-new-tokens 2048
 ```
+
+Default `--max-new-tokens` matches the session API (see `turboquant.constants.DEFAULT_MAX_NEW_TOKENS`). Inside the REPL, type `/tokens N` or `/help`.
 
 Loads the model once, then gives you an interactive prompt:
 
