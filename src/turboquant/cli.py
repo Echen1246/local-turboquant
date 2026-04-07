@@ -16,19 +16,15 @@ from turboquant import (
 )
 from turboquant.adapters.transformers import TransformersLoadConfig
 
+_DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+_DEFAULT_BITS = 4
 _SUPPORTED_BITS = [2, 3, 4]
-
-_VARIANTS = {
-    "qmse_packed": "Packed Q_mse cache (default, recommended)",
-    "qmse": "Dense reconstructed Q_mse cache",
-    "baseline": "No quantization (for comparison)",
-}
 
 _TESTED_MODELS = [
     {
         "id": "meta-llama/Llama-3.1-8B-Instruct",
         "status": "fully working",
-        "notes": "80% savings at 73K ctx, all layers quantize cleanly",
+        "notes": "74% savings, all layers quantize cleanly, Q_prod default",
     },
     {
         "id": "Qwen/Qwen2.5-7B-Instruct",
@@ -57,63 +53,37 @@ def _print_json(payload: dict[str, Any]) -> None:
 def _read_prompt(args) -> str:
     if args.prompt is not None:
         return args.prompt
-    if args.prompt_file is not None:
+    if getattr(args, "prompt_file", None) is not None:
         return Path(args.prompt_file).read_text()
     raise ValueError("Either --prompt or --prompt-file is required.")
 
 
 def _common_load_kwargs(args) -> dict[str, Any]:
     return {
-        "revision": args.revision,
-        "dtype": args.dtype,
-        "device_map": args.device_map,
-        "attn_implementation": args.attn_implementation,
-        "trust_remote_code": args.trust_remote_code,
-        "token": args.token,
-        "cache_dir": args.cache_dir,
+        "revision": getattr(args, "revision", None),
+        "dtype": getattr(args, "dtype", "auto"),
+        "device_map": getattr(args, "device_map", "auto"),
+        "attn_implementation": getattr(args, "attn_implementation", "sdpa"),
+        "trust_remote_code": getattr(args, "trust_remote_code", False),
+        "token": getattr(args, "token", None),
+        "cache_dir": getattr(args, "cache_dir", None),
     }
 
 
-def _handle_info(args) -> int:
-    from turboquant import __version__
+# ── Colors ────────────────────────────────────────────────────────
 
-    if args.json:
-        _print_json({
-            "version": __version__,
-            "variants": _VARIANTS,
-            "supported_bits": _SUPPORTED_BITS,
-            "tested_models": _TESTED_MODELS,
-        })
-        return 0
+def _colors():
+    if not sys.stdout.isatty():
+        return {"C": "", "B": "", "D": "", "R": "", "G": "", "Y": ""}
+    return {
+        "C": "\033[36m", "B": "\033[1m", "D": "\033[2m",
+        "R": "\033[0m", "G": "\033[32m", "Y": "\033[33m",
+    }
 
-    print(f"TurboQuant v{__version__}")
-    print()
-    print("Quantization modes:")
-    for name, desc in _VARIANTS.items():
-        print(f"  {name:<14} {desc}")
-    print()
-    print(f"Supported bit widths: {', '.join(str(b) for b in _SUPPORTED_BITS)}")
-    print()
-    print("Bit width guide:")
-    print("  4-bit  near-lossless (cosine sim ~0.995), ~75% KV savings")
-    print("  3-bit  very good (cosine sim ~0.983), ~80% KV savings")
-    print("  2-bit  experimental, visibly lossy")
-    print()
-    print("Tested models:")
-    for m in _TESTED_MODELS:
-        print(f"  {m['id']}")
-        print(f"    status: {m['status']}")
-        print(f"    {m['notes']}")
-    print()
-    print("Key flags:")
-    print("  --use-qjl-keys      Enable Q_prod (QJL sign sketch for keys)")
-    print("  --quantize-decode    Quantize decode-phase tokens too")
-    print("  --no-norm-guard      Disable per-layer norm guard (paper-faithful)")
-    return 0
 
+# ── GPU detection ─────────────────────────────────────────────────
 
 def _gpu_info() -> dict[str, Any]:
-    """Detect GPU hardware and CUDA availability."""
     info: dict[str, Any] = {"cuda_available": False, "devices": []}
     try:
         import torch
@@ -121,14 +91,12 @@ def _gpu_info() -> dict[str, Any]:
         info["cuda_version"] = getattr(torch.version, "cuda", None)
         info["torch_version"] = torch.__version__
         if torch.cuda.is_available():
-            count = torch.cuda.device_count()
-            for i in range(count):
+            for i in range(torch.cuda.device_count()):
                 props = torch.cuda.get_device_properties(i)
-                total_gb = props.total_mem / (1024**3)
                 info["devices"].append({
                     "index": i,
                     "name": props.name,
-                    "total_memory_gb": round(total_gb, 1),
+                    "total_memory_gb": round(props.total_mem / (1024**3), 1),
                     "compute_capability": f"{props.major}.{props.minor}",
                 })
     except ImportError:
@@ -137,24 +105,101 @@ def _gpu_info() -> dict[str, Any]:
 
 
 def _model_recommendations(vram_gb: float) -> list[str]:
-    """Suggest models and settings based on available VRAM."""
     recs = []
     if vram_gb >= 80:
-        recs.append("QwQ-32B / Llama-3.1-70B at 3-bit (full context)")
+        recs.append("Llama-3.1-70B at 3-bit (full context)")
     if vram_gb >= 48:
         recs.append("Llama-3.1-8B at 3-bit (100K+ context)")
-        recs.append("Qwen-2.5-7B at 4-bit (long context)")
     if vram_gb >= 24:
         recs.append("Llama-3.1-8B at 4-bit (up to ~73K context)")
-        recs.append("Qwen-2.5-7B at 3-bit (up to ~40K context)")
     if vram_gb >= 16:
         recs.append("Llama-3.1-8B at 3-bit (up to ~32K context)")
-    if vram_gb >= 8:
-        recs.append("Qwen-2.5-0.5B at 4-bit (small model, testing)")
     if not recs:
-        recs.append("Consider using Modal for cloud GPU access")
+        recs.append("Consider using Modal/Colab for cloud GPU access")
     return recs
 
+
+# ── Welcome ───────────────────────────────────────────────────────
+
+def _welcome() -> int:
+    from turboquant import __version__
+
+    c = _colors()
+    gpu = _gpu_info()
+    w = min(shutil.get_terminal_size((80, 24)).columns, 64)
+    bar = "─" * w
+
+    print(f"""{c['C']}
+  ╔╦╗┬ ┬┬─┐┌┐ ┌─┐╔═╗ ┬ ┬┌─┐┌┐┌┌┬┐
+   ║ │ │├┬┘├┴┐│ │║═╬╗│ │├─┤│││ │
+   ╩ └─┘┴└─└─┘└─┘╚═╝╚└─┘┴ ┴┘└┘ ┴{c['R']}
+""")
+    print(f"  {c['B']}v{__version__}{c['R']}  —  KV cache compression for HuggingFace Transformers")
+    print(f"  {c['D']}Paper-accurate Q_prod with fused Triton kernel{c['R']}")
+    print(f"  {c['D']}github.com/Echen1246/local-turboquant{c['R']}")
+    print()
+    print(f"  {bar}")
+    print()
+
+    print(f"  {c['B']}Quick start{c['R']}")
+    print()
+    print(f"  {c['G']}1.{c['R']}  One-shot prompt:")
+    print(f"      {c['D']}turboquant run --prompt \"Explain quantum computing\"{c['R']}")
+    print()
+    print(f"  {c['G']}2.{c['R']}  Interactive session:")
+    print(f"      {c['D']}turboquant attach{c['R']}")
+    print()
+    print(f"  {c['G']}3.{c['R']}  Python API:")
+    print(f"      {c['D']}from turboquant import TurboQuantSession{c['R']}")
+    print(f"      {c['D']}s = TurboQuantSession.from_pretrained(\"meta-llama/Llama-3.1-8B-Instruct\"){c['R']}")
+    print(f"      {c['D']}print(s.generate(\"Hello\"))  # KV cache auto-compressed{c['R']}")
+    print()
+    print(f"  {bar}")
+    print()
+
+    print(f"  {c['B']}Defaults{c['R']}")
+    print(f"    Model:    {_DEFAULT_MODEL}")
+    print(f"    Bits:     {_DEFAULT_BITS}-bit Q_prod (3-bit MSE keys + 1-bit QJL, 4-bit MSE values)")
+    print(f"    Savings:  ~74% KV cache VRAM reduction")
+    print(f"    Kernel:   Fused Triton (GPU) / chunked PyTorch (CPU fallback)")
+    print()
+
+    print(f"  {bar}")
+    print()
+    print(f"  {c['B']}Commands{c['R']}")
+    print()
+    print(f"  {c['Y']}turboquant run{c['R']}         Run a single prompt (default model + Q_prod)")
+    print(f"  {c['Y']}turboquant attach{c['R']}      Load model and prompt interactively")
+    print(f"  {c['Y']}turboquant setup{c['R']}       GPU detection, system info, recommendations")
+    print(f"  {c['Y']}turboquant telemetry{c['R']}   Display saved run telemetry")
+    print()
+
+    print(f"  {bar}")
+    print()
+    print(f"  {c['B']}System{c['R']}")
+
+    if gpu["cuda_available"] and gpu["devices"]:
+        dev = gpu["devices"][0]
+        print(f"  {c['G']}✓{c['R']} GPU: {dev['name']} ({dev['total_memory_gb']} GB)")
+        recs = _model_recommendations(dev["total_memory_gb"])
+        for r in recs[:2]:
+            print(f"    {c['D']}{r}{c['R']}")
+    elif platform.system() == "Darwin":
+        print(f"  {c['Y']}!{c['R']} No CUDA GPU (macOS) — use Colab/Modal for inference")
+    else:
+        print(f"  {c['Y']}!{c['R']} No CUDA GPU — TurboQuant requires NVIDIA GPU")
+
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if hf_token:
+        print(f"  {c['G']}✓{c['R']} HF_TOKEN set")
+    else:
+        print(f"  {c['D']}i{c['R']} HF_TOKEN not set {c['D']}(needed for gated models like Llama){c['R']}")
+
+    print()
+    return 0
+
+
+# ── Setup ─────────────────────────────────────────────────────────
 
 def _handle_setup(args) -> int:
     from turboquant import __version__
@@ -166,101 +211,85 @@ def _handle_setup(args) -> int:
             "version": __version__,
             "python": sys.version,
             "platform": platform.platform(),
-            "arch": platform.machine(),
             "gpu": gpu,
-            "hf_token_set": bool(
-                os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-            ),
-            "hf_cache_dir": os.environ.get("HF_HOME", "~/.cache/huggingface"),
+            "defaults": {
+                "model": _DEFAULT_MODEL,
+                "bits": _DEFAULT_BITS,
+                "qjl_keys": True,
+                "quantize_decode": True,
+            },
             "tested_models": _TESTED_MODELS,
         })
         return 0
 
-    w = shutil.get_terminal_size((80, 24)).columns
-    bar = "─" * min(w, 60)
+    c = _colors()
+    w = min(shutil.get_terminal_size((80, 24)).columns, 60)
+    bar = "─" * w
 
     print()
-    print(f"  TurboQuant v{__version__}")
-    print(f"  KV cache compression for HuggingFace Transformers")
+    print(f"  {c['B']}TurboQuant v{__version__}{c['R']}")
     print(bar)
 
     print()
-    print("  System")
-    print(f"    Python:     {sys.version.split()[0]}")
-    print(f"    Platform:   {platform.platform()}")
-    print(f"    Arch:       {platform.machine()}")
+    print(f"  {c['B']}System{c['R']}")
+    print(f"    Python:       {sys.version.split()[0]}")
+    print(f"    Platform:     {platform.platform()}")
 
     if gpu.get("torch_version"):
-        print(f"    PyTorch:    {gpu['torch_version']}")
-    else:
-        print("    PyTorch:    not installed")
-
+        print(f"    PyTorch:      {gpu['torch_version']}")
     try:
         import transformers
         print(f"    Transformers: {transformers.__version__}")
     except ImportError:
-        print("    Transformers: not installed")
+        print(f"    Transformers: {c['Y']}not installed{c['R']}")
 
     print()
-    print("  GPU")
+    print(f"  {c['B']}GPU{c['R']}")
     if gpu["cuda_available"] and gpu["devices"]:
-        print(f"    CUDA:       {gpu.get('cuda_version', 'unknown')}")
+        print(f"    CUDA:         {gpu.get('cuda_version', 'unknown')}")
         for dev in gpu["devices"]:
-            print(f"    Device {dev['index']}:   {dev['name']}")
-            print(f"                {dev['total_memory_gb']} GB VRAM"
-                  f"  (compute {dev['compute_capability']})")
+            print(f"    Device {dev['index']}:     {dev['name']} "
+                  f"({dev['total_memory_gb']} GB, compute {dev['compute_capability']})")
     elif platform.system() == "Darwin":
-        print("    CUDA:       not available (macOS)")
-        print("    Note:       CPU-only mode — use Modal for GPU inference")
+        print(f"    {c['Y']}No CUDA (macOS) — use Colab or Modal{c['R']}")
     else:
-        print("    CUDA:       not available")
-        print("    Note:       TurboQuant requires an NVIDIA GPU for real inference")
+        print(f"    {c['Y']}No CUDA GPU detected{c['R']}")
+
+    try:
+        from turboquant.runtime.triton_kernels import triton_available
+        if triton_available():
+            print(f"    Triton:       {c['G']}available{c['R']} (fused Q_prod kernel)")
+        else:
+            print(f"    Triton:       not available (PyTorch fallback)")
+    except ImportError:
+        print(f"    Triton:       not available (PyTorch fallback)")
 
     print()
-    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-    hf_cache = os.environ.get("HF_HOME", "~/.cache/huggingface")
-    print("  HuggingFace")
-    if hf_token:
-        masked = hf_token[:5] + "..." + hf_token[-4:]
-        print(f"    Token:      {masked}")
-    else:
-        print("    Token:      not set")
-        print("                Set HF_TOKEN for gated model access (Llama, Gemma, etc.)")
-    print(f"    Cache:      {hf_cache}")
-
-    print()
-    print("  Quantization")
-    print("    Modes:      qmse_packed (recommended), qmse, baseline")
-    print("    Bit widths: 4-bit (near-lossless), 3-bit (very good), 2-bit (experimental)")
-    print("    Kernel:     pure PyTorch (Triton kernel in development)")
+    print(f"  {c['B']}Defaults{c['R']}")
+    print(f"    Model:        {_DEFAULT_MODEL}")
+    print(f"    Quantization: {_DEFAULT_BITS}-bit Q_prod (paper-accurate)")
+    print(f"    Bit widths:   4 (near-lossless), 3 (very good), 2 (experimental)")
 
     if gpu["cuda_available"] and gpu["devices"]:
         max_vram = max(d["total_memory_gb"] for d in gpu["devices"])
         recs = _model_recommendations(max_vram)
         print()
-        print(f"  Recommended for {max_vram} GB VRAM")
+        print(f"  {c['B']}Recommended for {max_vram} GB VRAM{c['R']}")
         for r in recs:
             print(f"    - {r}")
 
     print()
-    print("  Tested models")
+    print(f"  {c['B']}Tested models{c['R']}")
     for m in _TESTED_MODELS:
-        status_icon = "+" if m["status"] == "fully working" else "~"
-        print(f"    [{status_icon}] {m['id']}")
-        print(f"        {m['notes']}")
+        icon = f"{c['G']}✓{c['R']}" if m["status"] == "fully working" else f"{c['Y']}~{c['R']}"
+        print(f"    {icon} {m['id']}")
+        print(f"      {c['D']}{m['notes']}{c['R']}")
 
     print()
-    print("  Quick start")
-    print("    turboquant run \\")
-    print("      --model meta-llama/Llama-3.1-8B-Instruct \\")
-    print("      --bits 4 --prompt \"Hello\" --show-telemetry")
-    print()
-    print(f"  See models.md for known issues and work in progress.")
-    print(bar)
-    print()
-
     return 0
 
+
+# ── Telemetry ─────────────────────────────────────────────────────
 
 def _handle_telemetry(args) -> int:
     path = Path(args.file)
@@ -272,343 +301,278 @@ def _handle_telemetry(args) -> int:
     telemetry = data.get("telemetry")
     metrics = data.get("metrics")
     if telemetry is None and metrics is None:
-        print("No telemetry or metrics found in the JSON file.")
-        print("Run with `turboquant run --json` to produce a file with telemetry.")
+        print("No telemetry found. Run with `turboquant run --json` to produce one.")
         return 1
 
-    variant = data.get("variant", "unknown")
-    bits = data.get("bits")
     model = data.get("model", "unknown")
-
+    bits = data.get("bits")
     print(f"Model:   {model}")
-    print(f"Variant: {variant}")
-    if bits is not None:
+    if bits:
         print(f"Bits:    {bits}")
     print()
 
-    if telemetry is not None:
+    if telemetry:
         dense = telemetry.get("dense_kv_bytes")
         packed = telemetry.get("packed_actual_bytes") or telemetry.get("packed_estimate_bytes")
         savings = telemetry.get("payload_savings_percent")
 
-        print("Cache compression:")
-        print(f"  Dense KV cache:  {_format_bytes(dense)}")
-        print(f"  Packed KV cache: {_format_bytes(packed)}")
+        print("Cache:")
+        print(f"  Dense KV:  {_format_bytes(dense)}")
+        print(f"  Packed KV: {_format_bytes(packed)}")
         if savings is not None:
-            print(f"  Savings:         {savings:.1f}%")
+            print(f"  Savings:   {savings:.1f}%")
         print()
 
         post_setup = telemetry.get("post_cache_setup_allocated_bytes")
         peak = telemetry.get("peak_allocated_bytes")
-        print("GPU memory:")
-        print(f"  After cache setup: {_format_bytes(post_setup)}")
-        print(f"  Peak during gen:   {_format_bytes(peak)}")
+        print("VRAM:")
+        print(f"  After setup: {_format_bytes(post_setup)}")
+        print(f"  Peak:        {_format_bytes(peak)}")
         print()
 
         gen_s = telemetry.get("generation_seconds")
-        quant_s = telemetry.get("quantization_seconds")
-        prompt_tok = telemetry.get("prompt_tokens")
         comp_tok = telemetry.get("completion_tokens")
+        prompt_tok = telemetry.get("prompt_tokens")
         print("Timing:")
-        if prompt_tok is not None:
-            print(f"  Prompt tokens:       {prompt_tok}")
-        if comp_tok is not None:
-            print(f"  Completion tokens:   {comp_tok}")
-        if quant_s is not None:
-            print(f"  Quantization time:   {quant_s:.3f}s")
-        if gen_s is not None:
-            print(f"  Generation time:     {gen_s:.3f}s")
+        if prompt_tok:
+            print(f"  Prompt:      {prompt_tok} tokens")
+        if comp_tok:
+            print(f"  Generated:   {comp_tok} tokens")
+        if gen_s:
+            print(f"  Gen time:    {gen_s:.3f}s")
             if comp_tok and gen_s > 0:
-                print(f"  Tokens/sec:          {comp_tok / gen_s:.1f}")
+                print(f"  Speed:       {comp_tok / gen_s:.1f} tok/s")
 
-    if metrics is not None:
+    if metrics:
         recon = metrics.get("reconstruction_quality")
-        if recon is not None:
+        if recon:
             print()
-            print("Reconstruction quality:")
-            k_cos = recon.get("avg_key_cosine_sim")
-            v_cos = recon.get("avg_val_cosine_sim")
-            k_mse = recon.get("avg_key_mse")
-            v_mse = recon.get("avg_val_mse")
-            dense_layers = recon.get("dense_layer_count")
-            quant_layers = recon.get("quantized_layer_count")
-            if k_cos is not None:
-                print(f"  Key cosine sim:      {k_cos:.6f}")
-            if v_cos is not None:
-                print(f"  Value cosine sim:    {v_cos:.6f}")
-            if k_mse is not None:
-                print(f"  Key MSE:             {k_mse:.6f}")
-            if v_mse is not None:
-                print(f"  Value MSE:           {v_mse:.6f}")
-            if dense_layers is not None:
-                print(f"  Dense layers:        {dense_layers}")
-            if quant_layers is not None:
-                print(f"  Quantized layers:    {quant_layers}")
+            print("Quality:")
+            for key in ("avg_key_cosine_sim", "avg_val_cosine_sim"):
+                v = recon.get(key)
+                if v is not None:
+                    label = key.replace("avg_", "").replace("_", " ").title()
+                    print(f"  {label}: {v:.6f}")
 
     return 0
 
 
-def _handle_inspect(args) -> int:
-    tokenizer, model = load_transformers_model(
-        TransformersLoadConfig(
-            model_id_or_path=args.model,
-            **_common_load_kwargs(args),
-        )
+# ── Print telemetry summary inline ────────────────────────────────
+
+def _print_telemetry_summary(telemetry: dict) -> None:
+    c = _colors()
+    dense = telemetry.get("dense_kv_bytes")
+    packed = telemetry.get("packed_actual_bytes") or telemetry.get("packed_estimate_bytes")
+    savings = telemetry.get("payload_savings_percent")
+    gen_s = telemetry.get("generation_seconds")
+    comp_tok = telemetry.get("completion_tokens")
+
+    parts = []
+    if savings is not None:
+        parts.append(f"{savings:.0f}% KV saved")
+    if dense and packed:
+        saved_mb = (dense - packed) / (1024 * 1024)
+        parts.append(f"{saved_mb:.0f} MB freed")
+    if gen_s and comp_tok:
+        parts.append(f"{comp_tok / gen_s:.1f} tok/s")
+    elif gen_s:
+        parts.append(f"{gen_s:.1f}s")
+
+    if parts:
+        print(f"\n{c['D']}[TurboQuant] {' | '.join(parts)}{c['R']}")
+
+
+# ── Attach (interactive REPL) ────────────────────────────────────
+
+def _handle_attach(args) -> int:
+    c = _colors()
+    model_id = args.model
+
+    print()
+    print(f"  {c['B']}Loading {model_id}{c['R']}")
+
+    qjl = not args.no_qjl
+    quant_decode = not args.no_quantize_decode
+    bits = args.bits
+
+    mode = "Q_prod" if qjl else "Q_mse"
+    print(f"  {c['D']}{bits}-bit {mode} | quantize_decode={'on' if quant_decode else 'off'}{c['R']}")
+    print()
+
+    session = TurboQuantSession.from_pretrained(
+        model_id,
+        variant="qmse_packed",
+        bits=bits,
+        use_qjl_keys=qjl,
+        quantize_decode=quant_decode,
+        norm_guard=not getattr(args, "no_norm_guard", False),
+        **_common_load_kwargs(args),
     )
-    _ = tokenizer
-    report = inspect_transformers_model_compatibility(model).to_dict()
-    if args.json:
-        _print_json(report)
-        return 0
 
-    print(f"model: {args.model}")
-    print(f"backend: {report['backend']}")
-    print(f"compatible: {report['compatible']}")
-    if report["reasons"]:
-        print("reasons:")
-        for item in report["reasons"]:
-            print(f"- {item}")
-    if report["warnings"]:
-        print("warnings:")
-        for item in report["warnings"]:
-            print(f"- {item}")
-    if report["details"]:
-        print("details:")
-        for key, value in report["details"].items():
-            print(f"- {key}: {value}")
+    gpu = _gpu_info()
+    if gpu["cuda_available"] and gpu["devices"]:
+        dev = gpu["devices"][0]
+        print(f"  {c['G']}✓{c['R']} Model loaded on {dev['name']}")
+    else:
+        print(f"  {c['G']}✓{c['R']} Model loaded")
+
+    print(f"  {c['G']}✓{c['R']} TurboQuant {bits}-bit {mode} active")
+    print(f"  {c['D']}Type a prompt and press Enter. Ctrl+C or 'exit' to quit.{c['R']}")
+    print()
+
+    max_tokens = args.max_new_tokens
+
+    while True:
+        try:
+            prompt = input(f"{c['G']}> {c['R']}")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            break
+
+        prompt = prompt.strip()
+        if not prompt or prompt.lower() in ("exit", "quit", ":q"):
+            break
+
+        if prompt.startswith("/tokens "):
+            try:
+                max_tokens = int(prompt.split()[1])
+                print(f"{c['D']}Max tokens set to {max_tokens}{c['R']}")
+            except (ValueError, IndexError):
+                print(f"{c['Y']}Usage: /tokens <number>{c['R']}")
+            continue
+
+        if prompt == "/stats":
+            telemetry = session.last_telemetry()
+            if telemetry:
+                _print_telemetry_summary(telemetry)
+            else:
+                print(f"{c['D']}No telemetry yet — send a prompt first.{c['R']}")
+            continue
+
+        if prompt == "/help":
+            print(f"  {c['D']}/tokens N   — set max generation tokens (current: {max_tokens}){c['R']}")
+            print(f"  {c['D']}/stats     — show last generation telemetry{c['R']}")
+            print(f"  {c['D']}/help      — show this help{c['R']}")
+            print(f"  {c['D']}exit       — quit{c['R']}")
+            continue
+
+        text = session.generate(prompt=prompt, max_new_tokens=max_tokens)
+        print(text)
+
+        telemetry = session.last_telemetry()
+        if telemetry:
+            _print_telemetry_summary(telemetry)
+        print()
+
     return 0
 
+
+# ── Run (one-shot) ────────────────────────────────────────────────
 
 def _handle_run(args) -> int:
     prompt = _read_prompt(args)
+    qjl = not args.no_qjl
+    quant_decode = not args.no_quantize_decode
+
     session = TurboQuantSession.from_pretrained(
         args.model,
-        variant=args.variant,
+        variant="qmse_packed" if not args.baseline else "baseline",
         bits=args.bits,
-        rotation_seed=args.rotation_seed,
-        num_outlier_channels=args.num_outlier_channels,
-        outlier_extra_bits=args.outlier_extra_bits,
-        use_qjl_keys=args.use_qjl_keys,
-        quantize_decode=args.quantize_decode,
-        norm_guard=not args.no_norm_guard,
+        rotation_seed=getattr(args, "rotation_seed", 0),
+        use_qjl_keys=qjl,
+        quantize_decode=quant_decode,
+        norm_guard=not getattr(args, "no_norm_guard", False),
         **_common_load_kwargs(args),
     )
-    text = session.generate(
-        prompt=prompt,
-        max_new_tokens=args.max_new_tokens,
-    )
-    metrics = session.last_metrics()
+    text = session.generate(prompt=prompt, max_new_tokens=args.max_new_tokens)
     telemetry = session.last_telemetry()
-    payload = {
-        "model": args.model,
-        "variant": args.variant,
-        "bits": args.bits if args.variant != "baseline" else None,
-        "text": text,
-        "metrics": metrics,
-        "telemetry": telemetry,
-    }
+    metrics = session.last_metrics()
+
     if args.json:
-        _print_json(payload)
+        _print_json({
+            "model": args.model,
+            "bits": args.bits,
+            "qjl": qjl,
+            "text": text,
+            "metrics": metrics,
+            "telemetry": telemetry,
+        })
         return 0
 
     print(text)
-    if args.show_metrics and metrics is not None:
-        print("\nmetrics:")
+    if telemetry:
+        _print_telemetry_summary(telemetry)
+    if args.verbose and metrics:
+        print("\nMetrics:")
         _print_json(metrics)
-    if args.show_telemetry and telemetry is not None:
-        print("\ntelemetry:")
-        print(f"- dense_kv_bytes: {_format_bytes(telemetry['dense_kv_bytes'])}")
-        print(f"- packed_estimate_bytes: {_format_bytes(telemetry['packed_estimate_bytes'])}")
-        print(f"- packed_actual_bytes: {_format_bytes(telemetry['packed_actual_bytes'])}")
-        print(f"- payload_savings_percent: {telemetry['payload_savings_percent']}")
-        print(
-            f"- post_cache_setup_allocated_bytes: "
-            f"{_format_bytes(telemetry['post_cache_setup_allocated_bytes'])}"
-        )
-        print(f"- peak_allocated_bytes: {_format_bytes(telemetry['peak_allocated_bytes'])}")
-        print(f"- generation_seconds: {telemetry['generation_seconds']}")
-        print(f"- quantization_seconds: {telemetry['quantization_seconds']}")
+
     return 0
 
 
-def _welcome() -> int:
-    from turboquant import __version__
+# ── Shared load args ─────────────────────────────────────────────
 
-    gpu = _gpu_info()
+def _add_load_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--revision", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--dtype", default="auto", help="Model dtype (default: auto)")
+    p.add_argument("--device-map", default="auto", help=argparse.SUPPRESS)
+    p.add_argument("--attn-implementation", default="sdpa", help=argparse.SUPPRESS)
+    p.add_argument("--trust-remote-code", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--token", default=None, help="HuggingFace token for gated models")
+    p.add_argument("--cache-dir", default=None, help=argparse.SUPPRESS)
 
-    CYAN = "\033[36m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RESET = "\033[0m"
-    GREEN = "\033[32m"
-    YELLOW = "\033[33m"
 
-    if not sys.stdout.isatty():
-        CYAN = BOLD = DIM = RESET = GREEN = YELLOW = ""
+def _add_quant_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--model", default=_DEFAULT_MODEL,
+        help=f"Model ID or path (default: {_DEFAULT_MODEL})",
+    )
+    p.add_argument("--bits", type=int, default=_DEFAULT_BITS, help=f"Bit width (default: {_DEFAULT_BITS})")
+    p.add_argument("--no-qjl", action="store_true", help="Disable QJL (use Q_mse instead of Q_prod)")
+    p.add_argument(
+        "--no-quantize-decode", action="store_true",
+        help="Keep decode tokens dense (don't re-quantize)",
+    )
+    p.add_argument("--no-norm-guard", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--max-new-tokens", type=int, default=256, help="Max tokens to generate (default: 256)")
 
-    art = f"""{CYAN}
-  ╔╦╗┬ ┬┬─┐┌┐ ┌─┐╔═╗ ┬ ┬┌─┐┌┐┌┌┬┐
-   ║ │ │├┬┘├┴┐│ │║═╬╗│ │├─┤│││ │
-   ╩ └─┘┴└─└─┘└─┘╚═╝╚└─┘┴ ┴┘└┘ ┴{RESET}
-"""
-    print(art)
-    print(f"  {BOLD}v{__version__}{RESET}  —  KV cache compression for HuggingFace Transformers")
-    print(f"  {DIM}Based on DeepMind's TurboQuant paper (ICLR 2026){RESET}")
-    print(f"  {DIM}github.com/Echen1246/local-turboquant{RESET}")
-    print()
 
-    w = min(shutil.get_terminal_size((80, 24)).columns, 64)
-    bar = "─" * w
-
-    print(f"  {bar}")
-    print()
-    print(f"  {BOLD}Getting started{RESET}")
-    print()
-    print(f"  {GREEN}1.{RESET}  Load any HuggingFace model (local or remote):")
-    print(f"      {DIM}from transformers import AutoModelForCausalLM, AutoTokenizer{RESET}")
-    print(f"      {DIM}model = AutoModelForCausalLM.from_pretrained(\"./my-model\", ...){RESET}")
-    print(f"      {DIM}tokenizer = AutoTokenizer.from_pretrained(\"./my-model\"){RESET}")
-    print()
-    print(f"  {GREEN}2.{RESET}  Activate TurboQuant — one line:")
-    print(f"      {DIM}import turboquant{RESET}")
-    print(f"      {DIM}turboquant.activate(model, tokenizer, bits=4){RESET}")
-    print()
-    print(f"  {GREEN}3.{RESET}  Use model.generate() normally — KV cache is now compressed:")
-    print(f"      {DIM}output = model.generate(input_ids, max_new_tokens=256){RESET}")
-    print()
-    print(f"  {bar}")
-    print()
-    print(f"  {BOLD}Commands{RESET}")
-    print()
-    print(f"  {YELLOW}turboquant setup{RESET}       Detect GPU, system info, model recommendations")
-    print(f"  {YELLOW}turboquant info{RESET}        Supported bit widths, modes, and tested models")
-    print(f"  {YELLOW}turboquant run{RESET}         Run a prompt with TurboQuant compression")
-    print(f"  {YELLOW}turboquant inspect{RESET}     Check if a model is compatible with TurboQuant")
-    print(f"  {YELLOW}turboquant telemetry{RESET}   Display formatted telemetry from a saved run")
-    print()
-    print(f"  {bar}")
-    print()
-    print(f"  {BOLD}System{RESET}")
-
-    if gpu["cuda_available"] and gpu["devices"]:
-        dev = gpu["devices"][0]
-        print(f"  {GREEN}✓{RESET} GPU detected: {dev['name']} ({dev['total_memory_gb']} GB)")
-    elif platform.system() == "Darwin":
-        print(f"  {YELLOW}!{RESET} No CUDA GPU (macOS) — use Modal or a remote GPU for inference")
-    else:
-        print(f"  {YELLOW}!{RESET} No CUDA GPU detected — TurboQuant requires NVIDIA GPU")
-
-    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-    if hf_token:
-        print(f"  {GREEN}✓{RESET} HF_TOKEN is set {DIM}(only needed to download gated models){RESET}")
-    else:
-        print(f"  {DIM}i{RESET} HF_TOKEN not set {DIM}(only needed to download gated models like Llama){RESET}")
-
-    print()
-    return 0
-
+# ── Parser ────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="turboquant",
-        description="TurboQuant-style KV-cache compression for Hugging Face Transformers.",
+        description="TurboQuant — KV cache compression for HuggingFace Transformers.",
     )
-    subparsers = parser.add_subparsers(dest="command", required=False)
+    sub = parser.add_subparsers(dest="command", required=False)
 
-    setup_parser = subparsers.add_parser(
-        "setup", help="Detect GPU, show system info, and recommend settings."
-    )
-    setup_parser.add_argument("--json", action="store_true", help="Print as JSON.")
-    setup_parser.set_defaults(func=_handle_setup)
+    # setup
+    sp_setup = sub.add_parser("setup", help="GPU detection, system info, recommendations")
+    sp_setup.add_argument("--json", action="store_true")
+    sp_setup.set_defaults(func=_handle_setup)
 
-    info_parser = subparsers.add_parser(
-        "info", help="Show supported quantization settings, bit widths, and tested models."
-    )
-    info_parser.add_argument("--json", action="store_true", help="Print as JSON.")
-    info_parser.set_defaults(func=_handle_info)
+    # run
+    sp_run = sub.add_parser("run", help="Run a single prompt with TurboQuant compression")
+    _add_load_args(sp_run)
+    _add_quant_args(sp_run)
+    prompt_group = sp_run.add_mutually_exclusive_group(required=True)
+    prompt_group.add_argument("--prompt", default=None, help="Prompt text")
+    prompt_group.add_argument("--prompt-file", default=None, help="Read prompt from file")
+    sp_run.add_argument("--baseline", action="store_true", help="Run without compression (for comparison)")
+    sp_run.add_argument("--json", action="store_true", help="Output as JSON")
+    sp_run.add_argument("-v", "--verbose", action="store_true", help="Show full metrics")
+    sp_run.add_argument("--rotation-seed", type=int, default=0, help=argparse.SUPPRESS)
+    sp_run.set_defaults(func=_handle_run)
 
-    telemetry_parser = subparsers.add_parser(
-        "telemetry", help="Display formatted telemetry from a saved JSON run output."
-    )
-    telemetry_parser.add_argument("file", help="Path to a JSON file from `turboquant run --json`.")
-    telemetry_parser.set_defaults(func=_handle_telemetry)
+    # attach
+    sp_attach = sub.add_parser("attach", help="Load model and prompt interactively")
+    _add_load_args(sp_attach)
+    _add_quant_args(sp_attach)
+    sp_attach.set_defaults(func=_handle_attach)
 
-    def add_load_args(target) -> None:
-        target.add_argument("--model", required=True, help="Hugging Face model ID or local model path.")
-        target.add_argument("--revision", default=None, help="Optional model revision.")
-        target.add_argument("--dtype", default="auto", help="Transformers dtype argument. Default: auto.")
-        target.add_argument("--device-map", default="auto", help="Transformers device_map argument.")
-        target.add_argument(
-            "--attn-implementation",
-            default="sdpa",
-            help="Attention backend to request from Transformers. Default: sdpa.",
-        )
-        target.add_argument(
-            "--trust-remote-code",
-            action="store_true",
-            help="Pass trust_remote_code=True when loading the model/tokenizer.",
-        )
-        target.add_argument("--token", default=None, help="Optional Hugging Face token.")
-        target.add_argument("--cache-dir", default=None, help="Optional Hugging Face cache directory.")
-
-    inspect_parser = subparsers.add_parser("inspect", help="Load a model and report TurboQuant compatibility.")
-    add_load_args(inspect_parser)
-    inspect_parser.add_argument("--json", action="store_true", help="Print the report as JSON.")
-    inspect_parser.set_defaults(func=_handle_inspect)
-
-    run_parser = subparsers.add_parser("run", help="Run a prompt through a Transformers model with TurboQuant.")
-    add_load_args(run_parser)
-    prompt_group = run_parser.add_mutually_exclusive_group(required=True)
-    prompt_group.add_argument("--prompt", default=None, help="Prompt text.")
-    prompt_group.add_argument("--prompt-file", default=None, help="Read the prompt from a file.")
-    run_parser.add_argument(
-        "--variant",
-        default="qmse_packed",
-        choices=["baseline", "qmse", "qmse_packed"],
-        help="Generation variant to use. Default: qmse_packed.",
-    )
-    run_parser.add_argument("--bits", type=int, default=3, help="Quantization bits for qmse variants.")
-    run_parser.add_argument("--rotation-seed", type=int, default=0, help="Rotation seed. Default: 0.")
-    run_parser.add_argument(
-        "--num-outlier-channels",
-        type=int,
-        default=0,
-        help="Number of head_dim channels to treat as outliers and quantize at higher precision.",
-    )
-    run_parser.add_argument(
-        "--outlier-extra-bits",
-        type=int,
-        default=1,
-        help="Additional bits to allocate to outlier channels beyond the base bit width.",
-    )
-    run_parser.add_argument(
-        "--use-qjl-keys",
-        action="store_true",
-        help="Enable QJL residual correction for keys (TurboQuant_prod). Gives unbiased attention logits.",
-    )
-    run_parser.add_argument(
-        "--quantize-decode",
-        action="store_true",
-        help="Also quantize tokens generated during decode (increases compression, may reduce quality).",
-    )
-    run_parser.add_argument(
-        "--no-norm-guard",
-        action="store_true",
-        help="Disable per-layer norm guard (all layers get quantized, paper-faithful).",
-    )
-    run_parser.add_argument("--max-new-tokens", type=int, default=256, help="Max generated tokens.")
-    run_parser.add_argument("--json", action="store_true", help="Print full output as JSON.")
-    run_parser.add_argument(
-        "--show-metrics",
-        action="store_true",
-        help="Print the raw generation metrics after the response.",
-    )
-    run_parser.add_argument(
-        "--show-telemetry",
-        action="store_true",
-        help="Print a concise cache/memory telemetry summary after the response.",
-    )
-    run_parser.set_defaults(func=_handle_run)
+    # telemetry
+    sp_telem = sub.add_parser("telemetry", help="Display saved telemetry from a JSON run")
+    sp_telem.add_argument("file", help="Path to JSON from `turboquant run --json`")
+    sp_telem.set_defaults(func=_handle_telemetry)
 
     return parser
 
