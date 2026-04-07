@@ -390,7 +390,7 @@ def activate(
         tq: _TurboQuantState = model._tq_state
         tok = model._tq_tokenizer
 
-        max_new_tokens = kwargs.pop("max_new_tokens", DEFAULT_MAX_NEW_TOKENS)
+        max_new_tokens = kwargs.pop("max_new_tokens", None) or kwargs.pop("max_length", None) or 20
         attention_mask = kwargs.pop("attention_mask", None)
 
         if input_ids is None:
